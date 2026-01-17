@@ -4,7 +4,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
-EXCEL_PATH = BASE_DIR / "base" / "summary.xlsx"
+EXCEL_PATH = BASE_DIR / "base" / "simpe1.xlsx"
 DB_PATH = BASE_DIR / "data" / "app.db"
 
 try:
