@@ -1,0 +1,4 @@
+config_local.py
+data/
+__pycache__/
+*.pyc
