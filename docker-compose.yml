@@ -1,0 +1,7 @@
+services:
+  wardrobe-bot:
+    build: .
+    container_name: wardrobe-bot
+    env_file:
+      - .env
+    restart: unless-stopped
