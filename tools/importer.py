@@ -14,18 +14,23 @@ from tools.db import ensure_schema, insert_items, rebuild_fts, set_meta
 
 NAME_KEYWORDS = (
     "шкаф",
-    "кухн",
-    "тумб",
+    "пенал",
     "гардероб",
-    "стойк",
-    "кровать",
-    "панел",
+    "встро",
+    "стол",
+    "бенч",
+    "бар",
+    "перил",
+    "зеркал",
+    "перегород",
     "двер",
+    "панел",
 )
 
 MATERIAL_KEYWORDS = (
     "лдсп",
     "egger",
+    "ламинирован",
     "мдф",
     "mdf",
     "шпон",
@@ -35,6 +40,8 @@ MATERIAL_KEYWORDS = (
     "металл",
     "нерж",
     "сталь",
+    "алюм",
+    "порошк",
 )
 
 DIM_PATTERN = re.compile(r"\d{2,5}\s*[x×*х]\s*\d{2,5}\s*[x×*х]\s*\d{2,5}", re.IGNORECASE)
@@ -250,27 +257,34 @@ def parse_row(
     name = _normalize_text(_get_value(row, mapping.get("name_col")))
     description = _normalize_text(_get_value(row, mapping.get("desc_col")))
 
-    if not name and not description:
+    if not name:
+        return None
+    if _is_service_row(name):
         return None
 
     dims_raw = _get_value(row, mapping.get("dims_col"))
     w_mm, d_mm, h_mm = _parse_dimensions(dims_raw)
+    if w_mm is None and d_mm is None and h_mm is None:
+        w_mm, d_mm, h_mm = _parse_dimensions(" ".join(filter(None, (name, description))))
 
     qty = _to_float(_get_value(row, mapping.get("qty_col")))
     price_unit_val = _get_value(row, mapping.get("price_unit_col"))
     price_total_val = _get_value(row, mapping.get("price_total_col"))
     price_unit_ex_vat, price_total_ex_vat = _extract_price(price_unit_val, price_total_val, qty)
 
+    if _should_skip_row(name, description, qty, price_unit_ex_vat, price_total_ex_vat):
+        return None
+
     if not _has_signal(name, description, w_mm, d_mm, h_mm, price_unit_ex_vat, price_total_ex_vat):
         return None
 
-    flags_text = f"{name or ''} {description or ''}".lower()
-    has_led = int(any(token in flags_text for token in ("подсвет", "led", "лента")))
-    mat_ldsp = int(any(token in flags_text for token in ("лдсп", "egger")))
+    flags_text = _normalize_for_flags(f"{name or ''} {description or ''}")
+    has_led = int(any(token in flags_text for token in ("подсвет", "подсветка", "led", "лента")))
+    mat_ldsp = int(any(token in flags_text for token in ("лдсп", "egger", "ламинирован")))
     mat_mdf = int(any(token in flags_text for token in ("мдф", "mdf")))
     mat_veneer = int(any(token in flags_text for token in ("шпон", "veneer")))
     has_glass = int(any(token in flags_text for token in ("стекл", "зеркал")))
-    has_metal = int(any(token in flags_text for token in ("металл", "нерж", "сталь")))
+    has_metal = int(any(token in flags_text for token in ("металл", "нерж", "сталь", "алюм", "порошк")))
 
     raw_json = json.dumps(row.to_dict(), ensure_ascii=False)
 
@@ -335,12 +349,16 @@ def _parse_dimensions(value: Any) -> tuple[int | None, int | None, int | None]:
     text = str(value).strip()
     if not text or text.lower() == "nan":
         return (None, None, None)
-    normalized = text.lower().replace("мм", "").replace("mm", "")
+    normalized = _normalize_for_flags(text).replace("мм", "").replace("mm", "")
     normalized = re.sub(r"[×*хx]", "x", normalized)
+    w_mm = _extract_prefixed_dim(normalized, ("w", "ш", "ширин"))
+    d_mm = _extract_prefixed_dim(normalized, ("d", "г", "глубин"))
+    h_mm = _extract_prefixed_dim(normalized, ("h", "в", "высот"))
     numbers = re.findall(r"\d{2,5}", normalized)
-    if len(numbers) < 3:
-        return (None, None, None)
-    w_mm, d_mm, h_mm = (int(num) for num in numbers[:3])
+    if len(numbers) >= 3 and not all((w_mm, d_mm, h_mm)):
+        w_mm = w_mm or int(numbers[0])
+        d_mm = d_mm or int(numbers[1])
+        h_mm = h_mm or int(numbers[2])
     return (w_mm, d_mm, h_mm)
 
 
@@ -357,6 +375,51 @@ def _extract_price(
     if price_total and qty_value and qty_value > 0:
         return (price_total / qty_value, price_total)
     return (price_unit, price_total)
+
+
+def _normalize_for_flags(text: str) -> str:
+    lowered = text.lower().replace("ё", "е")
+    lowered = re.sub(r"[-–—]+", " ", lowered)
+    lowered = re.sub(r"[^\w\s]", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _extract_prefixed_dim(text: str, stems: tuple[str, ...]) -> int | None:
+    for stem in stems:
+        match = re.search(rf"{stem}\s*[:=]?\s*(\d{{2,5}})", text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _is_service_row(name: str) -> bool:
+    lowered = _normalize_for_flags(name)
+    return any(
+        token in lowered
+        for token in (
+            "наименование",
+            "описание",
+            "итого",
+            "итог",
+            "количество",
+            "кол-во",
+            "шт",
+            "ед",
+        )
+    )
+
+
+def _should_skip_row(
+    name: str,
+    description: str | None,
+    qty: float | None,
+    price_unit: float | None,
+    price_total: float | None,
+) -> bool:
+    if price_unit or price_total or qty:
+        return False
+    desc_len = len(description.strip()) if description else 0
+    return desc_len < 10 and len(name.strip()) < 5
 
 
 def _has_signal(

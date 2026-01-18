@@ -16,32 +16,25 @@ from telegram.ext import (
     filters,
 )
 
-from config import ADMIN_IDS, BOT_TOKEN, MAX_TG_FILE_MB, UPLOAD_DIR
-from tools.db import get_connection, get_meta, list_versions, set_meta
+from config import ADMIN_IDS, BOT_TOKEN
+from tools.db import (
+    add_allowed_user,
+    get_connection,
+    get_meta,
+    is_user_allowed,
+    list_allowed_users,
+    list_versions,
+    remove_allowed_user,
+    set_meta,
+)
 from tools.importer import import_workbook
-from tools.search import ParsedQuery, search_items, search_items_with_params
-
-
-class UploadState:
-    def __init__(self) -> None:
-        self.pending: set[int] = set()
-
-    def mark_pending(self, user_id: int) -> None:
-        self.pending.add(user_id)
-
-    def clear_pending(self, user_id: int) -> None:
-        self.pending.discard(user_id)
-
-    def is_pending(self, user_id: int) -> bool:
-        return user_id in self.pending
-
-
-UPLOAD_STATE = UploadState()
+from tools.search import ParsedQuery, find_similar, search_items, search_items_with_params
 
 MAX_RESULTS_DEFAULT = 10
 TOO_MANY_THRESHOLD = 60
 SHOW_ALL_LIMIT = 200
 PAGE_SIZE = 10
+VAT_RATE = 0.22
 
 LOGGER = logging.getLogger(__name__)
 
@@ -52,7 +45,8 @@ class SearchState:
     parsed: ParsedQuery
     keywords: list[str]
     flags: dict[str, bool | None]
-    tol: int
+    tol_by_dim: tuple[int | None, int | None, int | None]
+    items: list[dict]
     price_min: float | None = None
     price_max: float | None = None
     offset: int = 0
@@ -68,119 +62,96 @@ def is_admin(user_id: int | None) -> bool:
     return user_id is not None and user_id in ADMIN_IDS
 
 
+def is_authorized(user_id: int | None) -> bool:
+    if is_admin(user_id):
+        return True
+    if user_id is None:
+        return False
+    conn = get_connection()
+    allowed = is_user_allowed(conn, user_id)
+    conn.close()
+    return allowed
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
+        return
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(user_id):
+        await send_split_message(
+            context,
+            update.effective_chat.id,
+            "Нет доступа. Обратитесь к администратору.\n"
+            f"Ваш user_id: {user_id}",
+        )
         return
     await send_split_message(
         context,
         update.effective_chat.id,
-        "SpecAssist bot.\n"
-        "Use /s <query> to search.\n"
-        "Admins: /upload, /versions, /use <version>, /reindex.",
+        "SpecAssist — поиск по базе Excel.\n"
+        "Просто отправьте текстовый запрос или используйте /s.\n"
+        "Для подсказок: /help.",
+    )
+
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(user_id):
+        await send_split_message(
+            context,
+            update.effective_chat.id,
+            "Нет доступа. Обратитесь к администратору.",
+        )
+        return
+    await send_split_message(
+        context,
+        update.effective_chat.id,
+        "Примеры запросов:\n"
+        "- шкаф лдсп с подсветкой\n"
+        "- шкаф h2700 d400\n"
+        "- бенч стол металл\n"
+        "- перила нерж\n"
+        "\n"
+        "Можно указывать размеры частично: h2700, d400, w3000.\n"
+        "Можно указывать габариты: 3000x400x2800.",
     )
 
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(user_id):
+        await send_split_message(
+            context,
+            update.effective_chat.id,
+            "Нет доступа. Обратитесь к администратору.",
+        )
+        return
     query = " ".join(context.args).strip()
     if not query:
-        await send_split_message(context, update.effective_chat.id, "Usage: /s <query>")
+        await send_split_message(context, update.effective_chat.id, "Использование: /s <запрос>")
         return
-    conn = get_connection()
-    result = search_items(conn, query)
-    conn.close()
-    parsed = result["parsed"]
-    state = SearchState(
-        query=query,
-        parsed=parsed,
-        keywords=result["keywords"],
-        flags=result["flags"],
-        tol=result["tol"],
-        offset=0,
-        limit=PAGE_SIZE,
-        total=result["total"],
-        relaxed=result.get("relaxed", []),
-    )
-    SEARCH_STATE[update.effective_chat.id] = state
-    await _render_search_results(
-        context,
-        update.effective_chat.id,
-        result,
-        state,
-    )
+    await _handle_search(context, update.effective_chat.id, query)
 
 
-async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await send_split_message(context, update.effective_chat.id, "Not allowed.")
-        return
-    UPLOAD_STATE.mark_pending(update.effective_user.id)
-    await send_split_message(context, update.effective_chat.id, "Send Excel file as a document.")
-
-
-async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None or update.message.document is None:
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or not update.message.text:
         return
     user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id) or user_id is None:
-        await send_split_message(context, update.effective_chat.id, "Not allowed.")
+    if not is_authorized(user_id):
+        await send_split_message(
+            context,
+            update.effective_chat.id,
+            "Нет доступа. Обратитесь к администратору.",
+        )
         return
-    if not UPLOAD_STATE.is_pending(user_id):
+    query = update.message.text.strip()
+    if not query:
         return
-    UPLOAD_STATE.clear_pending(user_id)
-
-    doc = update.message.document
-    if doc.file_size:
-        limit_bytes = MAX_TG_FILE_MB * 1024 * 1024
-        if doc.file_size > limit_bytes:
-            size_mb = doc.file_size / 1024 / 1024
-            await send_split_message(
-                context,
-                update.effective_chat.id,
-                "File is too big ({size:.1f} MB). Limit is {limit} MB.\n"
-                "Please compress to .zip, split the file, or place it into data/uploads/ "
-                "and use /reindex <path> (admin only).".format(
-                    size=size_mb,
-                    limit=MAX_TG_FILE_MB,
-                ),
-            )
-            return
-    await send_split_message(context, update.effective_chat.id, "Download ok. Processing...")
-    file = await context.bot.get_file(doc.file_id)
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    file_name = doc.file_name or "upload.xlsx"
-    if not file_name.endswith(".xlsx"):
-        file_name = f"{file_name}.xlsx"
-    dest = UPLOAD_DIR / f"{timestamp}_{file_name}"
-    await file.download_to_drive(custom_path=str(dest))
-    await send_split_message(context, update.effective_chat.id, "Scanning sheets...")
-
-    result = await asyncio.to_thread(_import_file, dest)
-    conn = get_connection()
-    versions = list_versions(conn)
-    conn.close()
-    await send_split_message(
-        context,
-        update.effective_chat.id,
-        "Import report:\n"
-        "- version: {version}\n"
-        "- versions: {versions}\n"
-        "- detected sheets: {detected_sheets}\n"
-        "- skipped sheets: {skipped_sheets}\n"
-        "- rows inserted: {inserted}\n"
-        "- errors: {errors}\n"
-        "Active version set to {version}".format(
-            inserted=result["inserted"],
-            detected_sheets=result["detected_sheets"],
-            skipped_sheets=result["skipped_sheets"],
-            version=result["source_version"],
-            versions=", ".join(versions) if versions else "-",
-            errors=0,
-        ),
-    )
+    await _handle_search(context, update.effective_chat.id, query)
 
 
 def _import_file(path: Path) -> dict:
@@ -190,11 +161,37 @@ def _import_file(path: Path) -> dict:
     return result
 
 
+async def _handle_search(context: ContextTypes.DEFAULT_TYPE, chat_id: int, query: str) -> None:
+    conn = get_connection()
+    result = search_items(conn, query)
+    conn.close()
+    parsed = result["parsed"]
+    state = SearchState(
+        query=query,
+        parsed=parsed,
+        keywords=result["keywords"],
+        flags=result["flags"],
+        tol_by_dim=result["tol"],
+        items=result["results"],
+        offset=0,
+        limit=PAGE_SIZE,
+        total=result["total"],
+        relaxed=result.get("relaxed", []),
+    )
+    SEARCH_STATE[chat_id] = state
+    await _render_search_results(
+        context,
+        chat_id,
+        result,
+        state,
+    )
+
+
 async def versions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
     if not is_admin(update.effective_user.id if update.effective_user else None):
-        await send_split_message(context, update.effective_chat.id, "Not allowed.")
+        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
         return
     conn = get_connection()
     versions = list_versions(conn)
@@ -204,14 +201,14 @@ async def versions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await send_split_message(
             context,
             update.effective_chat.id,
-            "No active version. Upload Excel via /upload or run /reindex <path>",
+            "Нет активной версии. Импортируйте Excel локально через --reindex.",
         )
         return
     lines = []
     if not active:
-        lines.append("No active version. Upload Excel via /upload or run /reindex <path>")
+        lines.append("Нет активной версии. Импортируйте Excel локально через --reindex.")
         lines.append("")
-    lines.append("Versions:")
+    lines.append("Версии:")
     for version in versions:
         marker = " (active)" if version == active else ""
         lines.append(f"- {version}{marker}")
@@ -222,23 +219,23 @@ async def use_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if update.message is None:
         return
     if not is_admin(update.effective_user.id if update.effective_user else None):
-        await send_split_message(context, update.effective_chat.id, "Not allowed.")
+        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
         return
     if not context.args:
-        await send_split_message(context, update.effective_chat.id, "Usage: /use <version>")
+        await send_split_message(context, update.effective_chat.id, "Использование: /use <version>")
         return
     version = context.args[0]
     conn = get_connection()
     set_meta(conn, "active_version", version)
     conn.close()
-    await send_split_message(context, update.effective_chat.id, f"Active version set to {version}")
+    await send_split_message(context, update.effective_chat.id, f"Активная версия: {version}")
 
 
 async def reindex_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
     if not is_admin(update.effective_user.id if update.effective_user else None):
-        await send_split_message(context, update.effective_chat.id, "Not allowed.")
+        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
         return
     conn = get_connection()
     active = get_meta(conn, "active_version")
@@ -247,43 +244,107 @@ async def reindex_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send_split_message(
             context,
             update.effective_chat.id,
-            "No active version. Upload Excel via /upload or run /reindex <path>",
+            "Нет активной версии. Импортируйте Excel локально через --reindex.",
         )
         return
     path = get_meta(conn, f"version_path:{active}")
     conn.close()
     if not path:
-        await send_split_message(context, update.effective_chat.id, "Path for active version not found.")
+        await send_split_message(context, update.effective_chat.id, "Путь для активной версии не найден.")
         return
-    await send_split_message(context, update.effective_chat.id, "Reindexing current active file...")
+    await send_split_message(context, update.effective_chat.id, "Переиндексация активного файла...")
     result = await asyncio.to_thread(_import_file, Path(path))
     await send_split_message(
         context,
         update.effective_chat.id,
-        f"Reindexed {result['inserted']} rows. Active version {result['source_version']}",
+        f"Переиндексировано строк: {result['inserted']}. Активная версия: {result['source_version']}",
     )
 
 
-def _format_dims(w_mm: int | None, d_mm: int | None, h_mm: int | None) -> str:
-    dims = [val for val in (w_mm, d_mm, h_mm) if val is not None]
-    return "x".join(str(val) for val in dims) if dims else "-"
+async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    if not is_admin(update.effective_user.id if update.effective_user else None):
+        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
+        return
+    conn = get_connection()
+    rows = list_allowed_users(conn)
+    conn.close()
+    if not rows:
+        await send_split_message(context, update.effective_chat.id, "Список допущенных пользователей пуст.")
+        return
+    lines = ["Допущенные пользователи:"]
+    for row in rows:
+        display = str(row["user_id"])
+        if row["username"]:
+            display += f" (@{row['username']})"
+        name_parts = " ".join(filter(None, [row["first_name"], row["last_name"]]))
+        if name_parts:
+            display += f" — {name_parts}"
+        lines.append(display)
+    await send_split_message(context, update.effective_chat.id, "\n".join(lines))
 
 
-def _format_flags(item: dict) -> str:
-    flags = []
-    if item.get("has_led"):
-        flags.append("LED")
-    if item.get("mat_ldsp"):
-        flags.append("ЛДСП")
-    if item.get("mat_mdf"):
-        flags.append("МДФ")
-    if item.get("mat_veneer"):
-        flags.append("ШПОН")
-    if item.get("has_glass"):
-        flags.append("СТЕКЛО")
-    if item.get("has_metal"):
-        flags.append("МЕТАЛЛ")
-    return "/".join(flags)
+async def allow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    admin_id = update.effective_user.id if update.effective_user else None
+    if not is_admin(admin_id):
+        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
+        return
+    if not context.args:
+        await send_split_message(context, update.effective_chat.id, "Использование: /allow <user_id>")
+        return
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await send_split_message(context, update.effective_chat.id, "user_id должен быть числом.")
+        return
+    conn = get_connection()
+    add_allowed_user(
+        conn,
+        user_id=user_id,
+        username=None,
+        first_name=None,
+        last_name=None,
+        added_by=admin_id,
+        added_at=datetime.utcnow().isoformat(),
+    )
+    conn.close()
+    await send_split_message(context, update.effective_chat.id, f"Доступ выдан: {user_id}")
+
+
+async def deny_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    if not is_admin(update.effective_user.id if update.effective_user else None):
+        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
+        return
+    if not context.args:
+        await send_split_message(context, update.effective_chat.id, "Использование: /deny <user_id>")
+        return
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await send_split_message(context, update.effective_chat.id, "user_id должен быть числом.")
+        return
+    conn = get_connection()
+    remove_allowed_user(conn, user_id)
+    conn.close()
+    await send_split_message(context, update.effective_chat.id, f"Доступ отозван: {user_id}")
+
+
+def _format_dims(w_mm: int | None, d_mm: int | None, h_mm: int | None) -> str | None:
+    if w_mm is not None and d_mm is not None and h_mm is not None:
+        return f"{w_mm}×{d_mm}×{h_mm} мм"
+    parts = []
+    if w_mm is not None:
+        parts.append(f"Ш: {w_mm} мм")
+    if d_mm is not None:
+        parts.append(f"Г: {d_mm} мм")
+    if h_mm is not None:
+        parts.append(f"В: {h_mm} мм")
+    return ", ".join(parts) if parts else None
 
 
 def split_message(text: str, max_len: int = 3800) -> list[str]:
@@ -325,100 +386,69 @@ async def send_split_message(
     chat_id: int,
     text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
+    *,
+    parse_mode: str | None = None,
 ) -> None:
     parts = split_message(text)
     for idx, part in enumerate(parts):
         markup = reply_markup if idx == len(parts) - 1 else None
-        await context.bot.send_message(chat_id=chat_id, text=part, reply_markup=markup)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=part,
+            reply_markup=markup,
+            parse_mode=parse_mode,
+        )
 
 
-def _format_price(item: dict) -> str:
+def _format_currency(value: float) -> str:
+    rounded = int(round(value))
+    return f"{rounded:,}".replace(",", " ")
+
+
+def _format_price_lines(item: dict) -> list[str]:
     unit = item.get("price_unit_ex_vat")
     total = item.get("price_total_ex_vat")
     qty = item.get("qty")
-    parts = []
+    lines: list[str] = []
     if unit is not None:
-        parts.append(f"unit ex VAT: {unit:.2f}")
-    if total is not None:
-        parts.append(f"total ex VAT: {total:.2f}")
+        lines.append(f"Цена за 1 шт (без НДС): {_format_currency(unit)} ₽")
+        lines.append(f"Цена за 1 шт (с НДС 22%): {_format_currency(unit * (1 + VAT_RATE))} ₽")
     if qty is not None:
-        parts.append(f"qty: {qty:.2f}")
-    return " | ".join(parts) if parts else "-"
-
-
-def _format_description(description: str | None, limit: int = 200) -> str | None:
-    if not description:
-        return None
-    cleaned = description.strip().replace("\r\n", "\n")
-    if not cleaned:
-        return None
-    lines = cleaned.split("\n")
-    snippet = "\n".join(line.strip() for line in lines[:2] if line.strip())
-    if len(snippet) > limit:
-        return snippet[: limit - 1].rstrip() + "…"
-    return snippet
-
-
-def _format_item(item: dict, item_type: str | None) -> list[str]:
-    name = item.get("name") or "-"
-    item_type = item_type or "item"
-    lines = [f"{name} ({item_type})"]
-    dims = _format_dims(item.get("w_mm"), item.get("d_mm"), item.get("h_mm"))
-    if dims != "-":
-        lines.append(f"dims: {dims}")
-    price = _format_price(item)
-    if price != "-":
-        lines.append(f"price: {price}")
-    flags = _format_flags(item)
-    if flags:
-        lines.append(f"flags: {flags}")
-    description = _format_description(item.get("description"))
-    if description:
-        lines.append(description)
-    lines.append(
-        "source: sheet={sheet} row={row} version={version}".format(
-            sheet=item.get("source_sheet") or "-",
-            row=item.get("source_row") or "-",
-            version=item.get("source_version") or "-",
-        )
-    )
+        qty_display = int(qty) if isinstance(qty, float) and qty.is_integer() else qty
+        lines.append(f"Кол-во: {qty_display}")
+    if total is not None:
+        lines.append(f"Итого (без НДС): {_format_currency(total)} ₽")
+        lines.append(f"Итого (с НДС 22%): {_format_currency(total * (1 + VAT_RATE))} ₽")
     return lines
 
 
-def _format_query_summary(state: SearchState) -> str:
-    dims = _format_dims(*state.parsed.dims)
-    flags = _format_flags_from_filters(state.flags)
-    keywords = ", ".join(state.keywords) if state.keywords else "-"
-    parts = [
-        f"category: {state.parsed.category or '-'}",
-        f"dims: {dims}",
-        f"flags: {flags or '-'}",
-        f"keywords: {keywords}",
-        f"tol: {state.tol}",
-    ]
-    if state.relaxed:
-        parts.append(f"relaxed: {_format_relaxed_steps(state.relaxed)}")
-    if state.price_min is not None or state.price_max is not None:
-        parts.append(f"price: {_format_price_range(state.price_min, state.price_max)}")
-    return "\n".join(parts)
+def _format_description(description: str | None, limit: int = 200) -> tuple[str | None, bool]:
+    if not description:
+        return (None, False)
+    cleaned = description.strip().replace("\r\n", "\n")
+    if not cleaned:
+        return (None, False)
+    lines = cleaned.split("\n")
+    snippet = "\n".join(line.strip() for line in lines[:2] if line.strip())
+    if len(snippet) > limit:
+        return (snippet[: limit - 1].rstrip() + "…", True)
+    return (snippet, False)
 
 
-def _format_flags_from_filters(flags: dict[str, bool | None]) -> str:
-    labels = []
-    for key, label in (
-        ("has_led", "LED"),
-        ("mat_mdf", "МДФ"),
-        ("mat_ldsp", "ЛДСП"),
-        ("mat_veneer", "ШПОН"),
-        ("has_glass", "СТЕКЛО"),
-        ("has_metal", "МЕТАЛЛ"),
-    ):
-        state = flags.get(key)
-        if state is True:
-            labels.append(label)
-        elif state is False:
-            labels.append(f"{label}✕")
-    return "/".join(labels)
+def _format_item(item: dict, item_type: str | None, index: int) -> tuple[list[str], bool]:
+    name = item.get("name") or "-"
+    lines = [f"{index}. <b>{_escape_html(name)}</b>"]
+    dims = _format_dims(item.get("w_mm"), item.get("d_mm"), item.get("h_mm"))
+    if dims:
+        lines.append(f"Габариты: {dims}")
+    lines.extend(_escape_lines(_format_price_lines(item)))
+    description, truncated = _format_description(item.get("description"))
+    if description:
+        lines.append(f"Описание: {_escape_html(description)}")
+    sheet = item.get("source_sheet") or "-"
+    row = item.get("source_row") or "-"
+    lines.append(f'Excel: лист "{_escape_html(str(sheet))}", строка {row}')
+    return lines, truncated or bool(description)
 
 
 def _format_price_range(price_min: float | None, price_max: float | None) -> str:
@@ -433,26 +463,38 @@ def _format_price_range(price_min: float | None, price_max: float | None) -> str
 
 def _format_relaxed_steps(steps: list[str]) -> str:
     label_map = {
-        "drop:has_led": "LED ignored",
-        "drop:mat_ldsp": "ЛДСП ignored",
-        "drop:mat_mdf": "МДФ ignored",
-        "drop:mat_veneer": "ШПОН ignored",
-        "drop:has_glass": "СТЕКЛО ignored",
-        "drop:has_metal": "МЕТАЛЛ ignored",
+        "drop:has_led": "подсветка игнорируется",
+        "drop:mat_ldsp": "ЛДСП игнорируется",
+        "drop:mat_mdf": "МДФ игнорируется",
+        "drop:mat_veneer": "шпон игнорируется",
+        "drop:has_glass": "стекло игнорируется",
+        "drop:has_metal": "металл игнорируется",
     }
     formatted = []
     for step in steps:
         if step in label_map:
             formatted.append(label_map[step])
         elif step.startswith("tol="):
-            formatted.append(step.replace("tol=", "tol="))
+            formatted.append(step.replace("tol=", "допуск="))
         elif step == "keywords:shortened":
-            formatted.append("keywords shortened")
+            formatted.append("ключевые слова сокращены")
         elif step == "fallback:text-only":
-            formatted.append("text-only fallback")
+            formatted.append("поиск только по тексту")
         else:
             formatted.append(step)
     return ", ".join(formatted)
+
+
+def _escape_html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _escape_lines(lines: list[str]) -> list[str]:
+    return [_escape_html(line) for line in lines]
 
 
 def _next_flag_state(current: bool | None) -> bool | None:
@@ -464,11 +506,11 @@ def _next_flag_state(current: bool | None) -> bool | None:
 
 
 def _flag_button_label(label: str, state: bool | None) -> str:
-    suffix = "any"
+    suffix = "люб."
     if state is True:
-        suffix = "yes"
+        suffix = "да"
     elif state is False:
-        suffix = "no"
+        suffix = "нет"
     return f"{label}: {suffix}"
 
 
@@ -478,18 +520,11 @@ def _build_overflow_keyboard(
     available_flags: dict[str, bool],
 ) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("➕ Add filters", callback_data="s:filters")],
-        [InlineKeyboardButton("📄 Show more (10)", callback_data="s:more")],
+        [InlineKeyboardButton("➕ Добавить фильтры", callback_data="s:filters")],
+        [InlineKeyboardButton("📄 Показать ещё (10)", callback_data="s:more")],
     ]
     if enable_show_all:
-        rows.append([InlineKeyboardButton("📄 Show all (careful)", callback_data="s:all")])
-    if state.parsed.dims != (None, None, None):
-        rows.append(
-            [
-                InlineKeyboardButton("↔️ Increase tol", callback_data="s:tol_up"),
-                InlineKeyboardButton("↔️ Decrease tol", callback_data="s:tol_down"),
-            ]
-        )
+        rows.append([InlineKeyboardButton("📄 Показать все (осторожно)", callback_data="s:all")])
     flag_row = []
     for key, label in (
         ("has_led", "LED"),
@@ -512,7 +547,31 @@ def _build_overflow_keyboard(
             flag_row = []
     if flag_row:
         rows.append(flag_row)
-    rows.append([InlineKeyboardButton("❌ Clear filters", callback_data="s:clear")])
+    rows.append([InlineKeyboardButton("❌ Очистить фильтры", callback_data="s:clear")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_results_keyboard(
+    state: SearchState,
+    action_items: list[tuple[int, bool]],
+    *,
+    enable_show_all: bool = False,
+    available_flags: dict[str, bool] | None = None,
+    include_overflow: bool = False,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, (item_id, has_desc) in enumerate(action_items, start=1):
+        row = [InlineKeyboardButton(f"Похожие #{idx}", callback_data=f"s:similar:{item_id}")]
+        if has_desc:
+            row.append(
+                InlineKeyboardButton(
+                    f"Показать полностью #{idx}", callback_data=f"s:desc:{item_id}"
+                )
+            )
+        rows.append(row)
+    if include_overflow and available_flags is not None:
+        overflow = _build_overflow_keyboard(state, enable_show_all, available_flags)
+        rows.extend(overflow.inline_keyboard)
     return InlineKeyboardMarkup(rows)
 
 
@@ -554,34 +613,57 @@ def _build_refine_keyboard(state: SearchState) -> InlineKeyboardMarkup:
             InlineKeyboardButton("300-700k", callback_data="s:price:range:300000:700000"),
             InlineKeyboardButton("700k+", callback_data="s:price:min:700000"),
         ],
-        [InlineKeyboardButton("Price: any", callback_data="s:price:clear")],
+        [InlineKeyboardButton("Цена: любая", callback_data="s:price:clear")],
     ]
-    if state.parsed.dims != (None, None, None):
-        rows.append(
-            [
-                InlineKeyboardButton("tol 20", callback_data="s:tol:20"),
-                InlineKeyboardButton("tol 50", callback_data="s:tol:50"),
-                InlineKeyboardButton("tol 100", callback_data="s:tol:100"),
-                InlineKeyboardButton("tol 200", callback_data="s:tol:200"),
-            ]
-        )
+    rows.extend(_build_dim_tolerance_rows(state))
     rows.append(
         [
-            InlineKeyboardButton("Apply", callback_data="s:apply"),
-            InlineKeyboardButton("Cancel", callback_data="s:cancel"),
+            InlineKeyboardButton("Применить", callback_data="s:apply"),
+            InlineKeyboardButton("Отмена", callback_data="s:cancel"),
         ]
     )
     return InlineKeyboardMarkup(rows)
 
 
+def _build_dim_tolerance_rows(state: SearchState) -> list[list[InlineKeyboardButton]]:
+    rows: list[list[InlineKeyboardButton]] = []
+    w_mm, d_mm, h_mm = state.parsed.dims
+    if h_mm is not None:
+        rows.append(
+            [
+                InlineKeyboardButton("Допуск H: 50", callback_data="s:tol:h:50"),
+                InlineKeyboardButton("Допуск H: 100", callback_data="s:tol:h:100"),
+                InlineKeyboardButton("Допуск H: 150", callback_data="s:tol:h:150"),
+                InlineKeyboardButton("Допуск H: 200", callback_data="s:tol:h:200"),
+            ]
+        )
+    if d_mm is not None:
+        rows.append(
+            [
+                InlineKeyboardButton("Допуск D: 10", callback_data="s:tol:d:10"),
+                InlineKeyboardButton("Допуск D: 20", callback_data="s:tol:d:20"),
+                InlineKeyboardButton("Допуск D: 50", callback_data="s:tol:d:50"),
+            ]
+        )
+    if w_mm is not None:
+        rows.append(
+            [
+                InlineKeyboardButton("Допуск W: 50", callback_data="s:tol:w:50"),
+                InlineKeyboardButton("Допуск W: 100", callback_data="s:tol:w:100"),
+                InlineKeyboardButton("Допуск W: 200", callback_data="s:tol:w:200"),
+            ]
+        )
+    return rows
+
+
 def _build_no_results_keyboard(state: SearchState) -> InlineKeyboardMarkup:
     rows = []
     if state.parsed.dims != (None, None, None):
-        rows.append([InlineKeyboardButton("Increase tol", callback_data="s:tol_up")])
+        rows.append([InlineKeyboardButton("Добавить допуск", callback_data="s:filters")])
     rows.append(
         [
-            InlineKeyboardButton("Clear flags", callback_data="s:clear_flags"),
-            InlineKeyboardButton("Search text only", callback_data="s:text_only"),
+            InlineKeyboardButton("Сбросить материалы", callback_data="s:clear_flags"),
+            InlineKeyboardButton("Искать только по тексту", callback_data="s:text_only"),
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -598,8 +680,8 @@ async def _render_search_results(
     total = result["total"]
     lines: list[str] = []
     if total == 0:
-        lines.append("No exact match.")
-        lines.append("Try removing keywords or using a bigger tolerance.")
+        lines.append("Ничего не найдено.")
+        lines.append("Попробуйте убрать ключевые слова или увеличить допуск.")
         await send_split_message(
             context,
             chat_id,
@@ -608,56 +690,81 @@ async def _render_search_results(
         )
         return
 
-    header = f"Found ~{total} matches."
+    header = f"Найдено ~{total} вариантов."
     if state.relaxed:
-        header = "Exact match not found. Showing closest ({details}).".format(
+        header = "Точное совпадение не найдено. Показываю ближайшие ({details}).".format(
             details=_format_relaxed_steps(state.relaxed)
         )
     if total > TOO_MANY_THRESHOLD:
-        header = f"{header} Too many to display."
+        header = f"Найдено ~{total} вариантов. Слишком много, показываю лучшие."
     lines.append(header)
-    lines.append(_format_query_summary(state))
     lines.append("")
 
+    action_items: list[tuple[int, bool]] = []
     if total <= MAX_RESULTS_DEFAULT or show_page:
         if total <= MAX_RESULTS_DEFAULT:
-            lines.append("Results:")
+            lines.append("Результаты:")
         else:
             start = state.offset + 1
             end = min(state.offset + state.limit, total)
-            lines.append(f"Results {start}-{end}:")
-        for item in result["results"]:
-            lines.extend(_format_item(item, state.parsed.category))
+            lines.append(f"Результаты {start}-{end}:")
+        state.items = result["results"]
+        for idx, item in enumerate(result["results"], start=1):
+            item_lines, has_desc = _format_item(item, state.parsed.category, idx)
+            lines.extend(item_lines)
             lines.append("")
+            if item.get("id") is not None:
+                action_items.append((int(item["id"]), has_desc))
         reply_markup = None
-        if total > MAX_RESULTS_DEFAULT:
-            available_flags = {
-                key: any(item.get(key) for item in result["results"])
-                for key in state.flags.keys()
-            }
-            reply_markup = _build_overflow_keyboard(
+        available_flags = {
+            key: any(item.get(key) for item in result["results"])
+            for key in state.flags.keys()
+        }
+        if action_items:
+            reply_markup = _build_results_keyboard(
                 state,
+                action_items,
                 enable_show_all=total <= SHOW_ALL_LIMIT,
                 available_flags=available_flags,
+                include_overflow=total > MAX_RESULTS_DEFAULT,
             )
-        await send_split_message(context, chat_id, "\n".join(lines).strip(), reply_markup=reply_markup)
+        await send_split_message(
+            context,
+            chat_id,
+            "\n".join(lines).strip(),
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
         return
 
-    lines.append("Top matches preview:")
-    for item in result["results"][:5]:
-        lines.extend(_format_item(item, state.parsed.category))
+    lines.append("Лучшие совпадения:")
+    preview_items = result["results"][:5]
+    state.items = preview_items
+    for idx, item in enumerate(preview_items, start=1):
+        item_lines, has_desc = _format_item(item, state.parsed.category, idx)
+        lines.extend(item_lines)
         lines.append("")
+        if item.get("id") is not None:
+            action_items.append((int(item["id"]), has_desc))
 
     available_flags = {
-        key: any(item.get(key) for item in result["results"])
+        key: any(item.get(key) for item in preview_items)
         for key in state.flags.keys()
     }
-    keyboard = _build_overflow_keyboard(
+    keyboard = _build_results_keyboard(
         state,
+        action_items,
         enable_show_all=total <= SHOW_ALL_LIMIT,
         available_flags=available_flags,
+        include_overflow=True,
     )
-    await send_split_message(context, chat_id, "\n".join(lines).strip(), reply_markup=keyboard)
+    await send_split_message(
+        context,
+        chat_id,
+        "\n".join(lines).strip(),
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -668,23 +775,75 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = query.message.chat_id if query.message else None
     if chat_id is None:
         return
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(user_id):
+        await send_split_message(
+            context,
+            chat_id,
+            "Нет доступа. Обратитесь к администратору.",
+        )
+        return
     state = SEARCH_STATE.get(chat_id)
     if state is None:
-        await send_split_message(context, chat_id, "Search state expired. Please run /s again.")
+        await send_split_message(context, chat_id, "Состояние поиска устарело. Повторите запрос.")
         return
 
     action = query.data or ""
-    in_refine_menu = bool(query.message and query.message.text and "Refine filters" in query.message.text)
+    in_refine_menu = bool(query.message and query.message.text and "Уточните фильтры" in query.message.text)
+    if action.startswith("s:desc:"):
+        item_id = int(action.split(":")[2])
+        conn = get_connection()
+        row = conn.execute("SELECT name, description FROM items WHERE id = ?", (item_id,)).fetchone()
+        conn.close()
+        if not row:
+            await send_split_message(context, chat_id, "Описание не найдено.")
+            return
+        description = row["description"] or "Описание отсутствует."
+        message = f"<b>{_escape_html(row['name'] or '-')}</b>\n{_escape_html(description)}"
+        await send_split_message(context, chat_id, message, parse_mode="HTML")
+        return
+    if action.startswith("s:similar:"):
+        item_id = int(action.split(":")[2])
+        conn = get_connection()
+        row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        if not row:
+            conn.close()
+            await send_split_message(context, chat_id, "Элемент не найден.")
+            return
+        base_item = dict(row)
+        similar = find_similar(conn, base_item, limit=10)
+        conn.close()
+        if not similar:
+            await send_split_message(context, chat_id, "Похожие варианты не найдены.")
+            return
+        header_dims = _format_dims(base_item.get("w_mm"), base_item.get("d_mm"), base_item.get("h_mm"))
+        header_name = base_item.get("name") or "-"
+        header = (
+            f"Похожие варианты для: <b>{_escape_html(header_name)}</b>"
+            + (f" ({header_dims})" if header_dims else "")
+        )
+        lines = [header, ""]
+        for idx, item in enumerate(similar, start=1):
+            item_lines, _ = _format_item(item, state.parsed.category, idx)
+            lines.extend(item_lines)
+            lines.append("")
+        await send_split_message(
+            context,
+            chat_id,
+            "\n".join(lines).strip(),
+            parse_mode="HTML",
+        )
+        return
     if action == "s:filters":
         await send_split_message(
             context,
             chat_id,
-            "Refine filters:",
+            "Уточните фильтры:",
             reply_markup=_build_refine_keyboard(state),
         )
         return
     if action == "s:cancel":
-        await send_split_message(context, chat_id, "Canceled.")
+        await send_split_message(context, chat_id, "Отменено.")
         return
     if action == "s:clear":
         state.flags = {key: None for key in state.flags}
@@ -698,7 +857,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await send_split_message(
                 context,
                 chat_id,
-                "Refine filters:",
+                "Уточните фильтры:",
                 reply_markup=_build_refine_keyboard(state),
             )
             return
@@ -721,33 +880,39 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await send_split_message(
                 context,
                 chat_id,
-                "Refine filters:",
+                "Уточните фильтры:",
                 reply_markup=_build_refine_keyboard(state),
             )
             return
     if action.startswith("s:tol:"):
-        value = int(action.split(":")[2])
-        state.tol = value
+        parts = action.split(":")
+        dim = parts[2]
+        value = int(parts[3])
+        tol_w, tol_d, tol_h = state.tol_by_dim
+        if dim == "w":
+            tol_w = value
+        elif dim == "d":
+            tol_d = value
+        elif dim == "h":
+            tol_h = value
+        state.tol_by_dim = (tol_w, tol_d, tol_h)
         if in_refine_menu:
             await send_split_message(
                 context,
                 chat_id,
-                "Refine filters:",
+                "Уточните фильтры:",
                 reply_markup=_build_refine_keyboard(state),
             )
             return
-    if action == "s:tol_up":
-        state.tol = min(state.tol + 50, 500)
-    if action == "s:tol_down":
-        state.tol = max(state.tol - 50, 10)
     if action == "s:clear_flags":
         state.flags = {key: None for key in state.flags}
     if action == "s:text_only":
         state.flags = {key: None for key in state.flags}
         state.parsed = ParsedQuery(None, (None, None, None), state.flags, state.keywords)
+        state.tol_by_dim = (None, None, None)
     if action == "s:more":
         if state.offset + state.limit >= state.total:
-            await send_split_message(context, chat_id, "No more results.")
+            await send_split_message(context, chat_id, "Больше результатов нет.")
             return
         state.offset += state.limit
     if action == "s:all":
@@ -755,7 +920,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await send_split_message(
                 context,
                 chat_id,
-                "Too many results to show all. Please refine.",
+                "Слишком много результатов. Уточните фильтры.",
             )
             return
         state.offset = 0
@@ -772,7 +937,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         parsed=state.parsed,
         keywords=state.keywords,
         flags=state.flags,
-        tol=state.tol,
+        tol_by_dim=state.tol_by_dim,
         price_min=state.price_min,
         price_max=state.price_max,
         limit=state.limit,
@@ -783,6 +948,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state.parsed = result["parsed"]
     state.flags = result["flags"]
     state.keywords = result["keywords"]
+    state.tol_by_dim = result["tol"]
+    state.items = result["results"]
     state.relaxed = []
     if state.offset >= state.total:
         state.offset = 0
@@ -803,7 +970,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             await send_split_message(
                 context,
                 update.effective_chat.id,
-                "Something went wrong. Please try again later.",
+                "Что-то пошло не так. Попробуйте позже.",
             )
         except Exception:
             LOGGER.exception("Failed to send error message to user.")
@@ -812,17 +979,18 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set")
-    if not ADMIN_IDS:
-        LOGGER.warning("ADMIN_IDS is empty. Uploads will be disabled.")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("s", search_handler))
-    app.add_handler(CommandHandler("upload", upload_handler))
+    app.add_handler(CommandHandler("users", users_handler))
+    app.add_handler(CommandHandler("allow", allow_handler))
+    app.add_handler(CommandHandler("deny", deny_handler))
     app.add_handler(CommandHandler("versions", versions_handler))
     app.add_handler(CommandHandler("use", use_handler))
     app.add_handler(CommandHandler("reindex", reindex_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
     return app
 

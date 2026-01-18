@@ -52,6 +52,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         },
     )
     _ensure_table(conn, "meta", {"key": "TEXT PRIMARY KEY", "value": "TEXT"})
+    _ensure_table(
+        conn,
+        "allowed_users",
+        {
+            "user_id": "INTEGER PRIMARY KEY",
+            "username": "TEXT",
+            "first_name": "TEXT",
+            "last_name": "TEXT",
+            "added_by": "INTEGER",
+            "added_at": "TEXT",
+        },
+    )
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_items_version ON items(source_version)"
@@ -70,6 +82,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sheet_schema_sheet ON sheet_schemas(sheet_name)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_allowed_users_added_by ON allowed_users(added_by)"
     )
     conn.commit()
 
@@ -136,6 +151,49 @@ def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
 def list_versions(conn: sqlite3.Connection) -> list[str]:
     cursor = conn.execute("SELECT DISTINCT source_version FROM items ORDER BY source_version")
     return [row[0] for row in cursor.fetchall() if row[0]]
+
+
+def list_allowed_users(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    cursor = conn.execute(
+        "SELECT user_id, username, first_name, last_name, added_by, added_at FROM allowed_users"
+    )
+    return cursor.fetchall()
+
+
+def add_allowed_user(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    username: str | None,
+    first_name: str | None,
+    last_name: str | None,
+    added_by: int | None,
+    added_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO allowed_users (user_id, username, first_name, last_name, added_by, added_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_name=excluded.last_name,
+            added_by=excluded.added_by,
+            added_at=excluded.added_at
+        """,
+        (user_id, username, first_name, last_name, added_by, added_at),
+    )
+    conn.commit()
+
+
+def remove_allowed_user(conn: sqlite3.Connection, user_id: int) -> None:
+    conn.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+
+def is_user_allowed(conn: sqlite3.Connection, user_id: int) -> bool:
+    cursor = conn.execute("SELECT 1 FROM allowed_users WHERE user_id = ? LIMIT 1", (user_id,))
+    return cursor.fetchone() is not None
 
 
 def dump_json(value: dict | list | None) -> str | None:
