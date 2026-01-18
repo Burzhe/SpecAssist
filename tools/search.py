@@ -154,7 +154,7 @@ def _run_search(
     price_max: float | None = None,
 ) -> list[dict[str, Any]]:
     params: list[Any] = []
-    where = ["1=1"]
+    where = ["1=1", "items.is_valid = 1"]
     if active_version:
         where.append("items.source_version = ?")
         params.append(active_version)
