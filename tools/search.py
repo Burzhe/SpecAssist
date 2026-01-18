@@ -378,7 +378,7 @@ def _build_category_clause(category: str) -> tuple[str, list[Any]]:
         for field in fields:
             clauses.append(f"{field} LIKE ?")
             params.append(f"%{token}%")
-    return f\"({' OR '.join(clauses)})\", params
+    return f"({' OR '.join(clauses)})", params
 
 
 def _build_flag_clause(flag: str) -> tuple[str, list[Any]]:
@@ -387,13 +387,13 @@ def _build_flag_clause(flag: str) -> tuple[str, list[Any]]:
         "LOWER(COALESCE(items.name, ''))",
         "LOWER(COALESCE(items.description, ''))",
     ]
-    clauses = [f\"items.{flag} = 1\"]
+    clauses = [f"items.{flag} = 1"]
     params: list[Any] = []
     for token in tokens:
         for field in fields:
-            clauses.append(f\"{field} LIKE ?\")
-            params.append(f\"%{token}%\")
-    return f\"({' OR '.join(clauses)})\", params
+            clauses.append(f"{field} LIKE ?")
+            params.append(f"%{token}%")
+    return f"({' OR '.join(clauses)})", params
 
 
 def _keyword_score(text: str, keywords: list[str]) -> int:
