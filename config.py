@@ -28,7 +28,7 @@ for chunk in ADMIN_IDS_RAW.replace(";", ",").split(","):
     except ValueError:
         continue
 
-DEFAULT_TOL_MM = int(os.getenv("DEFAULT_TOL_MM", "50"))
+DEFAULT_TOL_MM = int(os.getenv("DEFAULT_TOL_MM", "100"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "10"))
 MAX_TG_FILE_MB = int(os.getenv("MAX_TG_FILE_MB", "20"))
 

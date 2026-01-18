@@ -27,6 +27,7 @@ from tools.db import (
     remove_allowed_user,
 )
 from tools.import_excel import reindex_with_report
+from tools.importer import debug_workbook_mapping
 from tools.search import ParsedQuery, find_similar, search_items, search_items_with_params
 
 MAX_RESULTS_DEFAULT = 10
@@ -51,7 +52,6 @@ class SearchState:
     offset: int = 0
     limit: int = PAGE_SIZE
     total: int = 0
-    relaxed: list[str] | None = None
 
 
 SEARCH_STATE: dict[int, SearchState] = {}
@@ -176,7 +176,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "SpecAssist — поиск по базе Excel.\n"
             "Просто отправьте текстовый запрос.\n"
             "Для подсказок: /help.\n\n"
-            "Команды администратора: /status, /users, /allow, /deny, /reindex."
+            "Команды администратора: /status, /users, /allow, /deny, /reindex, /debug_mapping."
         )
     await send_split_message(
         context,
@@ -254,7 +254,6 @@ async def _handle_search(context: ContextTypes.DEFAULT_TYPE, chat_id: int, query
         offset=0,
         limit=PAGE_SIZE,
         total=result["total"],
-        relaxed=result.get("relaxed", []),
     )
     SEARCH_STATE[chat_id] = state
     await _render_search_results(
@@ -295,6 +294,37 @@ async def reindex_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         LOGGER.warning("Cannot send reindex summary to admin %s: forbidden", update.effective_chat.id)
     except Exception:
         LOGGER.exception("Failed to send reindex summary to admin %s", update.effective_chat.id)
+
+
+async def debug_mapping_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    if not is_admin(update.effective_user.id if update.effective_user else None):
+        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
+        return
+    if not EXCEL_PATH:
+        await send_split_message(context, update.effective_chat.id, "Путь к Excel не настроен.")
+        return
+    path = Path(EXCEL_PATH)
+    if not path.exists():
+        await send_split_message(context, update.effective_chat.id, "Файл Excel не найден.")
+        return
+    report = debug_workbook_mapping(path, max_rows_scan=50)
+    sheet_reports = report.get("sheet_reports", [])
+    for sheet in sheet_reports:
+        LOGGER.info("Debug mapping sheet: %s", sheet.get("sheet_name"))
+        LOGGER.info("  header_row: %s", sheet.get("header_row"))
+        LOGGER.info("  rows_total: %s", sheet.get("rows_total"))
+        LOGGER.info("  rows_inserted: %s", sheet.get("rows_inserted"))
+        LOGGER.info("  rows_skipped: %s", sheet.get("rows_skipped"))
+        LOGGER.info("  mapping: %s", sheet.get("mapping"))
+        LOGGER.info("  unused_headers: %s", sheet.get("unused_headers"))
+        LOGGER.info("  missing_critical_fields: %s", sheet.get("missing_critical_fields"))
+    await send_split_message(
+        context,
+        update.effective_chat.id,
+        "Отчет сформирован. Смотрите логи сервера.",
+    )
 
 
 async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -497,30 +527,6 @@ def _format_price_range(price_min: float | None, price_max: float | None) -> str
     return "-"
 
 
-def _format_relaxed_steps(steps: list[str]) -> str:
-    label_map = {
-        "drop:has_led": "подсветка игнорируется",
-        "drop:mat_ldsp": "ЛДСП игнорируется",
-        "drop:mat_mdf": "МДФ игнорируется",
-        "drop:mat_veneer": "шпон игнорируется",
-        "drop:has_glass": "стекло игнорируется",
-        "drop:has_metal": "металл игнорируется",
-    }
-    formatted = []
-    for step in steps:
-        if step in label_map:
-            formatted.append(label_map[step])
-        elif step.startswith("tol="):
-            formatted.append(step.replace("tol=", "допуск="))
-        elif step == "keywords:shortened":
-            formatted.append("ключевые слова сокращены")
-        elif step == "fallback:text-only":
-            formatted.append("поиск только по тексту")
-        else:
-            formatted.append(step)
-    return ", ".join(formatted)
-
-
 def _escape_html(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -552,38 +558,38 @@ def _flag_button_label(label: str, state: bool | None) -> str:
 
 def _build_overflow_keyboard(
     state: SearchState,
-    enable_show_all: bool,
     available_flags: dict[str, bool],
+    *,
+    include_flags: bool = True,
 ) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("➕ Добавить фильтры", callback_data="s:filters")],
-        [InlineKeyboardButton("📄 Показать ещё (10)", callback_data="s:more")],
+        [InlineKeyboardButton("Уточнить фильтры", callback_data="s:filters")],
+        [InlineKeyboardButton("Ещё 10", callback_data="s:more")],
     ]
-    if enable_show_all:
-        rows.append([InlineKeyboardButton("📄 Показать все (осторожно)", callback_data="s:all")])
-    flag_row = []
-    for key, label in (
-        ("has_led", "LED"),
-        ("mat_mdf", "МДФ"),
-        ("mat_ldsp", "ЛДСП"),
-        ("mat_veneer", "ШПОН"),
-        ("has_glass", "СТЕКЛО"),
-        ("has_metal", "МЕТАЛЛ"),
-    ):
-        if not available_flags.get(key):
-            continue
-        flag_row.append(
-            InlineKeyboardButton(
-                _flag_button_label(label, state.flags.get(key)),
-                callback_data=f"s:toggle:{key}",
+    if include_flags:
+        flag_row = []
+        for key, label in (
+            ("has_led", "LED"),
+            ("mat_mdf", "МДФ"),
+            ("mat_ldsp", "ЛДСП"),
+            ("mat_veneer", "ШПОН"),
+            ("has_glass", "СТЕКЛО"),
+            ("has_metal", "МЕТАЛЛ"),
+        ):
+            if not available_flags.get(key):
+                continue
+            flag_row.append(
+                InlineKeyboardButton(
+                    _flag_button_label(label, state.flags.get(key)),
+                    callback_data=f"s:toggle:{key}",
+                )
             )
-        )
-        if len(flag_row) == 3:
+            if len(flag_row) == 3:
+                rows.append(flag_row)
+                flag_row = []
+        if flag_row:
             rows.append(flag_row)
-            flag_row = []
-    if flag_row:
-        rows.append(flag_row)
-    rows.append([InlineKeyboardButton("❌ Очистить фильтры", callback_data="s:clear")])
+    rows.append([InlineKeyboardButton("Сброс", callback_data="s:clear")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -591,7 +597,6 @@ def _build_results_keyboard(
     state: SearchState,
     action_items: list[tuple[int, bool]],
     *,
-    enable_show_all: bool = False,
     available_flags: dict[str, bool] | None = None,
     include_overflow: bool = False,
 ) -> InlineKeyboardMarkup:
@@ -606,7 +611,11 @@ def _build_results_keyboard(
             )
         rows.append(row)
     if include_overflow and available_flags is not None:
-        overflow = _build_overflow_keyboard(state, enable_show_all, available_flags)
+        overflow = _build_overflow_keyboard(
+            state,
+            available_flags,
+            include_flags=state.total <= TOO_MANY_THRESHOLD,
+        )
         rows.extend(overflow.inline_keyboard)
     return InlineKeyboardMarkup(rows)
 
@@ -727,10 +736,6 @@ async def _render_search_results(
         return
 
     header = f"Найдено ~{total} вариантов."
-    if state.relaxed:
-        header = "Точное совпадение не найдено. Показываю ближайшие ({details}).".format(
-            details=_format_relaxed_steps(state.relaxed)
-        )
     if total > TOO_MANY_THRESHOLD:
         header = f"Найдено ~{total} вариантов. Слишком много, показываю лучшие."
     lines.append(header)
@@ -762,7 +767,6 @@ async def _render_search_results(
             reply_markup = _build_results_keyboard(
                 state,
                 action_items,
-                enable_show_all=total <= SHOW_ALL_LIMIT,
                 available_flags=available_flags,
                 include_overflow=total > MAX_RESULTS_DEFAULT,
             )
@@ -792,7 +796,6 @@ async def _render_search_results(
     keyboard = _build_results_keyboard(
         state,
         action_items,
-        enable_show_all=total <= SHOW_ALL_LIMIT,
         available_flags=available_flags,
         include_overflow=True,
     )
@@ -973,7 +976,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         state.flags = {key: None for key in state.flags}
     if action == "s:text_only":
         state.flags = {key: None for key in state.flags}
-        state.parsed = ParsedQuery(None, (None, None, None), state.flags, state.keywords)
+        state.parsed = ParsedQuery(
+            None,
+            False,
+            (None, None, None),
+            (None, None, None),
+            state.flags,
+            state.keywords,
+        )
         state.tol_by_dim = (None, None, None)
     if action == "s:more":
         if state.offset + state.limit >= state.total:
@@ -1015,7 +1025,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state.keywords = result["keywords"]
     state.tol_by_dim = result["tol"]
     state.items = result["results"]
-    state.relaxed = []
     if state.offset >= state.total:
         state.offset = 0
 
@@ -1052,6 +1061,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("allow", allow_handler))
     app.add_handler(CommandHandler("deny", deny_handler))
     app.add_handler(CommandHandler("reindex", reindex_handler))
+    app.add_handler(CommandHandler("debug_mapping", debug_mapping_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
