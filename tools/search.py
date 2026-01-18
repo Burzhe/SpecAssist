@@ -9,7 +9,7 @@ from config import DEFAULT_TOL_MM, MAX_RESULTS
 from tools.db import get_meta
 
 CATEGORY_MAP = {
-    "шкаф": ("шкаф", "шкаф-купе", "шкафчик"),
+    "шкаф": ("шкаф", "шкаф купе", "шкафчик"),
     "кухня": ("кухн", "кухон"),
     "гардероб": ("гардероб", "гардеробн"),
     "тумба": ("тумб",),
@@ -17,15 +17,23 @@ CATEGORY_MAP = {
     "кровать": ("кроват",),
     "панель": ("панел",),
     "дверь": ("двер",),
+    "стол": ("стол",),
+    "бенч": ("бенч", "bench"),
+    "бар": ("бар",),
+    "перила": ("перил",),
+    "зеркало": ("зеркал",),
+    "поручень": ("поручн",),
+    "перегородка": ("перегород",),
+    "витрина": ("витрин",),
 }
 
 FLAG_TOKENS = {
-    "has_led": ("подсвет", "led", "лента"),
-    "mat_ldsp": ("лдсп", "egger"),
+    "has_led": ("подсвет", "подсветка", "led", "лента"),
+    "mat_ldsp": ("лдсп", "egger", "ламинирован"),
     "mat_mdf": ("мдф", "mdf"),
     "mat_veneer": ("шпон", "veneer"),
     "has_glass": ("стекл", "зеркал"),
-    "has_metal": ("металл", "нерж", "сталь"),
+    "has_metal": ("металл", "сталь", "нерж", "алюм", "порошк"),
 }
 
 
@@ -38,11 +46,12 @@ class ParsedQuery:
 
 
 def parse_query(query: str) -> ParsedQuery:
-    lowered = query.lower()
-    dims = _extract_dims(lowered)
-    category = _extract_category(lowered)
-    flags = {key: any(token in lowered for token in tokens) for key, tokens in FLAG_TOKENS.items()}
-    keywords = _extract_keywords(lowered)
+    normalized = _normalize_query(query)
+    dims = _extract_dims(normalized)
+    category = _extract_category(normalized)
+    flags = {key: any(token in normalized for token in tokens) for key, tokens in FLAG_TOKENS.items()}
+    keywords = _extract_keywords(normalized)
+    keywords = _expand_keywords(normalized, keywords)
     return ParsedQuery(category=category, dims=dims, flags=flags, keywords=keywords)
 
 
@@ -265,3 +274,21 @@ def _extract_keywords(text: str) -> list[str]:
     words = re.split(r"[^\w]+", text)
     keywords = [word for word in words if len(word) >= 3 and not word.isdigit()]
     return keywords[:10]
+
+
+def _normalize_query(query: str) -> str:
+    lowered = query.lower().replace("ё", "е")
+    lowered = lowered.replace("-", " ")
+    lowered = re.sub(r"[×*х]", "x", lowered)
+    lowered = re.sub(r"[^\w\s]", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+
+def _expand_keywords(text: str, keywords: list[str]) -> list[str]:
+    expanded = list(keywords)
+    if any(token in text for token in ("встройка", "встраиваемый", "встроенный")):
+        expanded.append("встро")
+    if "бенч стол" in text or "bench table" in text:
+        expanded.extend(["бенч", "стол"])
+    return expanded[:10]
