@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -77,24 +77,60 @@ async def _send_startup_summary(app: Application) -> None:
     if not ADMIN_IDS:
         return
     conn = get_connection()
-    total_items = int(get_meta(conn, "stats:total_items") or 0)
     valid_items = int(get_meta(conn, "stats:valid_items") or 0)
-    sheets_detected = int(get_meta(conn, "stats:sheets_detected") or 0)
     skipped_rows = int(get_meta(conn, "stats:skipped_rows") or 0)
-    rows_with_price_unit = int(get_meta(conn, "stats:rows_with_price_unit") or 0)
+    sheets_total = int(get_meta(conn, "stats:sheets_total") or 0)
+    sheets_problematic = int(get_meta(conn, "stats:sheets_problematic") or 0)
     conn.close()
-    message = (
-        "База актуализирована: изделий {total} (валидных {valid}), листов {sheets}, "
-        "пропущено {skipped} строк. Цена за ед. найдена у {unit_rows} позиций."
-    ).format(
-        total=total_items,
-        valid=valid_items,
-        sheets=sheets_detected,
-        skipped=skipped_rows,
-        unit_rows=rows_with_price_unit,
+    message = _build_admin_summary_message(
+        sheets_total=sheets_total,
+        valid_items=valid_items,
+        skipped_rows=skipped_rows,
+        sheets_problematic=sheets_problematic,
     )
     for admin_id in ADMIN_IDS:
         await app.bot.send_message(chat_id=admin_id, text=message)
+
+
+def _build_admin_summary_message(
+    *,
+    sheets_total: int,
+    valid_items: int,
+    skipped_rows: int,
+    sheets_problematic: int,
+) -> str:
+    message = (
+        "База обновлена. Листов: {sheets}, валидных позиций: {valid}, пропущено: {skipped}."
+    ).format(
+        sheets=sheets_total,
+        valid=valid_items,
+        skipped=skipped_rows,
+    )
+    if sheets_problematic:
+        message += f" Проблемные листы: {sheets_problematic}. См. консольные логи."
+    return message
+
+
+async def _send_admin_message(text: str) -> None:
+    if not ADMIN_IDS or not BOT_TOKEN:
+        return
+    bot = Bot(token=BOT_TOKEN)
+    for admin_id in ADMIN_IDS:
+        await bot.send_message(chat_id=admin_id, text=text)
+
+
+def send_admin_import_summary(result: dict) -> None:
+    if not ADMIN_IDS or not BOT_TOKEN:
+        return
+    summary = result.get("summary") or {}
+    stats = result.get("stats") or {}
+    message = _build_admin_summary_message(
+        sheets_total=int(summary.get("sheets_total", 0)),
+        valid_items=int(stats.get("valid_items", 0)),
+        skipped_rows=int(summary.get("rows_skipped", result.get("skipped_rows", 0))),
+        sheets_problematic=int(summary.get("sheets_problematic", 0)),
+    )
+    asyncio.run(_send_admin_message(message))
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
