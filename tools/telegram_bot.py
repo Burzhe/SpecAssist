@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Forbidden
 from telegram.ext import (
     Application,
@@ -17,18 +17,16 @@ from telegram.ext import (
     filters,
 )
 
-from config import ADMIN_IDS, BOT_TOKEN
+from config import ADMIN_IDS, BOT_TOKEN, EXCEL_PATH
 from tools.db import (
     add_allowed_user,
+    get_latest_import_summary,
     get_connection,
-    get_meta,
     is_user_allowed,
     list_allowed_users,
-    list_versions,
     remove_allowed_user,
-    set_meta,
 )
-from tools.importer import import_workbook
+from tools.import_excel import reindex_with_report
 from tools.search import ParsedQuery, find_similar, search_items, search_items_with_params
 
 MAX_RESULTS_DEFAULT = 10
@@ -74,18 +72,19 @@ def is_authorized(user_id: int | None) -> bool:
     return allowed
 
 
-def _get_admin_summary_message() -> str:
+def _get_admin_summary_message() -> str | None:
     conn = get_connection()
-    valid_items = int(get_meta(conn, "stats:valid_items") or 0)
-    skipped_rows = int(get_meta(conn, "stats:skipped_rows") or 0)
-    sheets_total = int(get_meta(conn, "stats:sheets_total") or 0)
-    sheets_problematic = int(get_meta(conn, "stats:sheets_problematic") or 0)
+    summary = get_latest_import_summary(conn)
     conn.close()
+    if not summary:
+        return None
     return _build_admin_summary_message(
-        sheets_total=sheets_total,
-        valid_items=valid_items,
-        skipped_rows=skipped_rows,
-        sheets_problematic=sheets_problematic,
+        sheets_detected=int(summary["sheets_detected"] or 0),
+        rows_scanned=int(summary["rows_scanned"] or 0),
+        rows_inserted=int(summary["rows_inserted"] or 0),
+        rows_skipped=int(summary["rows_skipped"] or 0),
+        rows_unit_price_from_unit=int(summary["rows_unit_price_from_unit"] or 0),
+        rows_unit_price_from_total_qty=int(summary["rows_unit_price_from_total_qty"] or 0),
     )
 
 
@@ -93,6 +92,8 @@ async def _send_startup_summary(app: Application) -> None:
     if not ADMIN_IDS:
         return
     message = _get_admin_summary_message()
+    if not message:
+        return
     for admin_id in ADMIN_IDS:
         try:
             await app.bot.send_message(chat_id=admin_id, text=message)
@@ -104,43 +105,30 @@ async def _send_startup_summary(app: Application) -> None:
 
 def _build_admin_summary_message(
     *,
-    sheets_total: int,
-    valid_items: int,
-    skipped_rows: int,
-    sheets_problematic: int,
+    sheets_detected: int,
+    rows_scanned: int,
+    rows_inserted: int,
+    rows_skipped: int,
+    rows_unit_price_from_unit: int,
+    rows_unit_price_from_total_qty: int,
 ) -> str:
     message = (
-        "База обновлена. Листов: {sheets}, валидных позиций: {valid}, пропущено: {skipped}."
+        "Сводка импорта:\n"
+        "Листов обнаружено: {sheets}\n"
+        "Строк просмотрено: {scanned}\n"
+        "Строк добавлено: {inserted}\n"
+        "Строк пропущено: {skipped}\n"
+        "Цена из колонки: {unit}\n"
+        "Цена из итога/кол-ва: {total_qty}"
     ).format(
-        sheets=sheets_total,
-        valid=valid_items,
-        skipped=skipped_rows,
+        sheets=sheets_detected,
+        scanned=rows_scanned,
+        inserted=rows_inserted,
+        skipped=rows_skipped,
+        unit=rows_unit_price_from_unit,
+        total_qty=rows_unit_price_from_total_qty,
     )
-    if sheets_problematic:
-        message += f" Проблемные листы: {sheets_problematic}. См. консольные логи."
     return message
-
-
-async def _send_admin_message(text: str) -> None:
-    if not ADMIN_IDS or not BOT_TOKEN:
-        return
-    bot = Bot(token=BOT_TOKEN)
-    for admin_id in ADMIN_IDS:
-        await bot.send_message(chat_id=admin_id, text=text)
-
-
-def send_admin_import_summary(result: dict) -> None:
-    if not ADMIN_IDS or not BOT_TOKEN:
-        return
-    summary = result.get("summary") or {}
-    stats = result.get("stats") or {}
-    message = _build_admin_summary_message(
-        sheets_total=int(summary.get("sheets_total", 0)),
-        valid_items=int(stats.get("valid_items", 0)),
-        skipped_rows=int(summary.get("rows_skipped", result.get("skipped_rows", 0))),
-        sheets_problematic=int(summary.get("sheets_problematic", 0)),
-    )
-    asyncio.run(_send_admin_message(message))
 
 
 def _build_admin_start_keyboard() -> InlineKeyboardMarkup:
@@ -159,7 +147,10 @@ async def _send_admin_summary(
     chat_id: int,
 ) -> None:
     message = _get_admin_summary_message()
-    await send_split_message(context, chat_id, message)
+    if message:
+        await send_split_message(context, chat_id, message)
+    else:
+        await send_split_message(context, chat_id, "Сводка недоступна. Запустите /reindex.")
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -185,7 +176,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "SpecAssist — поиск по базе Excel.\n"
             "Просто отправьте текстовый запрос.\n"
             "Для подсказок: /help.\n\n"
-            "Команды администратора: /status, /users, /allow, /deny, /versions, /use, /reindex."
+            "Команды администратора: /status, /users, /allow, /deny, /reindex."
         )
     await send_split_message(
         context,
@@ -231,24 +222,6 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_authorized(user_id):
-        await send_split_message(
-            context,
-            update.effective_chat.id,
-            "Нет доступа. Обратитесь к администратору.",
-        )
-        return
-    query = " ".join(context.args).strip()
-    if not query:
-        await send_split_message(context, update.effective_chat.id, "Использование: /s <запрос>")
-        return
-    await _handle_search(context, update.effective_chat.id, query)
-
-
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or not update.message.text:
         return
@@ -264,13 +237,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not query:
         return
     await _handle_search(context, update.effective_chat.id, query)
-
-
-def _import_file(path: Path) -> dict:
-    conn = get_connection()
-    result = import_workbook(path, conn)
-    conn.close()
-    return result
 
 
 async def _handle_search(context: ContextTypes.DEFAULT_TYPE, chat_id: int, query: str) -> None:
@@ -299,78 +265,36 @@ async def _handle_search(context: ContextTypes.DEFAULT_TYPE, chat_id: int, query
     )
 
 
-async def versions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
-        return
-    conn = get_connection()
-    versions = list_versions(conn)
-    active = get_meta(conn, "active_version")
-    conn.close()
-    if not active and not versions:
-        await send_split_message(
-            context,
-            update.effective_chat.id,
-            "Нет активной версии. Импортируйте Excel локально через --reindex.",
-        )
-        return
-    lines = []
-    if not active:
-        lines.append("Нет активной версии. Импортируйте Excel локально через --reindex.")
-        lines.append("")
-    lines.append("Версии:")
-    for version in versions:
-        marker = " (active)" if version == active else ""
-        lines.append(f"- {version}{marker}")
-    await send_split_message(context, update.effective_chat.id, "\n".join(lines))
-
-
-async def use_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
-        return
-    if not context.args:
-        await send_split_message(context, update.effective_chat.id, "Использование: /use <version>")
-        return
-    version = context.args[0]
-    conn = get_connection()
-    set_meta(conn, "active_version", version)
-    conn.close()
-    await send_split_message(context, update.effective_chat.id, f"Активная версия: {version}")
-
-
 async def reindex_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
     if not is_admin(update.effective_user.id if update.effective_user else None):
         await send_split_message(context, update.effective_chat.id, "Нет доступа.")
         return
-    conn = get_connection()
-    active = get_meta(conn, "active_version")
-    if not active:
-        conn.close()
-        await send_split_message(
-            context,
-            update.effective_chat.id,
-            "Нет активной версии. Импортируйте Excel локально через --reindex.",
-        )
+    if not EXCEL_PATH:
+        await send_split_message(context, update.effective_chat.id, "Путь к Excel не настроен.")
         return
-    path = get_meta(conn, f"version_path:{active}")
-    conn.close()
-    if not path:
-        await send_split_message(context, update.effective_chat.id, "Путь для активной версии не найден.")
+    path = Path(EXCEL_PATH)
+    if not path.exists():
+        await send_split_message(context, update.effective_chat.id, "Файл Excel не найден.")
         return
-    await send_split_message(context, update.effective_chat.id, "Переиндексация активного файла...")
-    result = await asyncio.to_thread(_import_file, Path(path))
-    await send_split_message(
-        context,
-        update.effective_chat.id,
-        f"Переиндексировано строк: {result['inserted']}. Активная версия: {result['source_version']}",
+    await send_split_message(context, update.effective_chat.id, "Переиндексация Excel...")
+    result = await asyncio.to_thread(reindex_with_report, str(path))
+    summary = result.get("summary") or {}
+    message = _build_admin_summary_message(
+        sheets_detected=int(result.get("detected_sheets", 0)),
+        rows_scanned=int(summary.get("rows_total", 0)),
+        rows_inserted=int(summary.get("rows_inserted", 0)),
+        rows_skipped=int(summary.get("rows_skipped", 0)),
+        rows_unit_price_from_unit=int(summary.get("rows_unit_price_from_unit", 0)),
+        rows_unit_price_from_total_qty=int(summary.get("rows_unit_price_from_total_qty", 0)),
     )
+    try:
+        await send_split_message(context, update.effective_chat.id, message)
+    except Forbidden:
+        LOGGER.warning("Cannot send reindex summary to admin %s: forbidden", update.effective_chat.id)
+    except Exception:
+        LOGGER.exception("Failed to send reindex summary to admin %s", update.effective_chat.id)
 
 
 async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -810,6 +734,8 @@ async def _render_search_results(
     if total > TOO_MANY_THRESHOLD:
         header = f"Найдено ~{total} вариантов. Слишком много, показываю лучшие."
     lines.append(header)
+    if total > TOO_MANY_THRESHOLD:
+        lines.append("Совет: добавьте ключевые слова или фильтры.")
     lines.append("")
 
     action_items: list[tuple[int, bool]] = []
@@ -850,7 +776,7 @@ async def _render_search_results(
         return
 
     lines.append("Лучшие совпадения:")
-    preview_items = result["results"][:5]
+    preview_items = result["results"][:MAX_RESULTS_DEFAULT]
     state.items = preview_items
     for idx, item in enumerate(preview_items, start=1):
         item_lines, has_desc = _format_item(item, state.parsed.category, idx)
@@ -1122,12 +1048,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CommandHandler("help", help_handler))
-    app.add_handler(CommandHandler("s", search_handler))
     app.add_handler(CommandHandler("users", users_handler))
     app.add_handler(CommandHandler("allow", allow_handler))
     app.add_handler(CommandHandler("deny", deny_handler))
-    app.add_handler(CommandHandler("versions", versions_handler))
-    app.add_handler(CommandHandler("use", use_handler))
     app.add_handler(CommandHandler("reindex", reindex_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))

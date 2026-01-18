@@ -8,7 +8,6 @@ from config import DB_PATH
 
 ITEM_COLUMNS: dict[str, str] = {
     "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
-    "source_version": "TEXT",
     "source_sheet": "TEXT",
     "source_row": "INTEGER",
     "name": "TEXT",
@@ -45,14 +44,26 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "sheet_schemas",
         {
             "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
-            "source_version": "TEXT",
             "sheet_name": "TEXT",
             "detected": "INTEGER",
             "confidence": "REAL",
             "map_json": "TEXT",
         },
     )
-    _ensure_table(conn, "meta", {"key": "TEXT PRIMARY KEY", "value": "TEXT"})
+    _ensure_table(
+        conn,
+        "import_summary",
+        {
+            "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "created_at": "TEXT",
+            "sheets_detected": "INTEGER",
+            "rows_scanned": "INTEGER",
+            "rows_inserted": "INTEGER",
+            "rows_skipped": "INTEGER",
+            "rows_unit_price_from_unit": "INTEGER",
+            "rows_unit_price_from_total_qty": "INTEGER",
+        },
+    )
     _ensure_table(
         conn,
         "allowed_users",
@@ -67,9 +78,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
 
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_items_version ON items(source_version)"
-    )
-    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_items_sheet ON items(source_sheet)"
     )
     conn.execute(
@@ -77,9 +85,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_items_price ON items(price_unit_ex_vat)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sheet_schema_version ON sheet_schemas(source_version)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sheet_schema_sheet ON sheet_schemas(sheet_name)"
@@ -133,25 +138,60 @@ def rebuild_fts(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+def save_import_summary(
+    conn: sqlite3.Connection,
+    *,
+    created_at: str,
+    sheets_detected: int,
+    rows_scanned: int,
+    rows_inserted: int,
+    rows_skipped: int,
+    rows_unit_price_from_unit: int,
+    rows_unit_price_from_total_qty: int,
+) -> None:
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
+        """
+        INSERT INTO import_summary (
+            created_at,
+            sheets_detected,
+            rows_scanned,
+            rows_inserted,
+            rows_skipped,
+            rows_unit_price_from_unit,
+            rows_unit_price_from_total_qty
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            created_at,
+            sheets_detected,
+            rows_scanned,
+            rows_inserted,
+            rows_skipped,
+            rows_unit_price_from_unit,
+            rows_unit_price_from_total_qty,
+        ),
     )
     conn.commit()
 
 
-def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
-    cursor = conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
-    row = cursor.fetchone()
-    if not row:
-        return None
-    return str(row["value"])
-
-
-def list_versions(conn: sqlite3.Connection) -> list[str]:
-    cursor = conn.execute("SELECT DISTINCT source_version FROM items ORDER BY source_version")
-    return [row[0] for row in cursor.fetchall() if row[0]]
+def get_latest_import_summary(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    cursor = conn.execute(
+        """
+        SELECT
+            created_at,
+            sheets_detected,
+            rows_scanned,
+            rows_inserted,
+            rows_skipped,
+            rows_unit_price_from_unit,
+            rows_unit_price_from_total_qty
+        FROM import_summary
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+    return cursor.fetchone()
 
 
 def list_allowed_users(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -210,7 +250,6 @@ def insert_items(
     conn.executemany(
         """
         INSERT INTO items (
-            source_version,
             source_sheet,
             source_row,
             name,
@@ -229,7 +268,7 @@ def insert_items(
             has_metal,
             raw_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
