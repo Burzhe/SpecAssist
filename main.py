@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-
-from config import EXCEL_PATH
 
 
 def main() -> None:
@@ -71,14 +68,6 @@ def main() -> None:
         conn.close()
         print("Facets:", dict(row) if row else {})
         return
-
-    if EXCEL_PATH:
-        excel_path = Path(EXCEL_PATH)
-        if excel_path.exists():
-            from tools.import_excel import main as import_main
-
-            import_main(EXCEL_PATH)
-            return
 
     from tools.telegram_bot import run_bot
 

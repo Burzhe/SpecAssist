@@ -1,5 +1,11 @@
 services:
   specassist:
     build: .
+    env_file:
+      - .env
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ADMIN_IDS: ${ADMIN_IDS}
     volumes:
       - ./:/app
+    restart: unless-stopped
