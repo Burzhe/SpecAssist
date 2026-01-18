@@ -788,4 +788,5 @@ def build_app() -> Application:
 
 def run_bot() -> None:
     app = build_app()
+    LOGGER.info("Starting polling...")
     app.run_polling()
