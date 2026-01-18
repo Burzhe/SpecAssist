@@ -9,11 +9,6 @@ import pandas as pd
 from config import DB_PATH, EXCEL_PATH
 from schema_map import get_sheet_mapping, get_sheet_names
 
-DIMENSION_REGEX = re.compile(
-    r"(\d+(?:[.,]\d+)?)\s*(?:x|×|\*)\s*(\d+(?:[.,]\d+)?)(?:\s*(?:x|×|\*)\s*(\d+(?:[.,]\d+)?))?\s*(?:мм|mm|см|cm)?",
-    re.IGNORECASE,
-)
-
 LIGHT_TOKENS = (
     "light",
     "подсвет",
@@ -47,23 +42,15 @@ def _parse_dimensions(value: Any) -> tuple[float | None, float | None, float | N
     if value is None:
         return (None, None, None)
     text = str(value).strip()
-    if not text:
+    if not text or text.lower() == "nan":
         return (None, None, None)
-    match = DIMENSION_REGEX.search(text)
-    if not match:
+    normalized = text.lower().replace("мм", "").replace("mm", "")
+    normalized = re.sub(r"[×*хx]", "x", normalized)
+    numbers = re.findall(r"\d{2,5}", normalized)
+    if len(numbers) < 3:
         return (None, None, None)
-
-    numbers = [group for group in match.groups() if group]
-    parsed = [float(num.replace(",", ".")) for num in numbers]
-
-    unit_multiplier = 1.0
-    if re.search(r"(см|cm)", text, re.IGNORECASE):
-        unit_multiplier = 10.0
-
-    scaled = [val * unit_multiplier for val in parsed]
-    while len(scaled) < 3:
-        scaled.append(None)
-    return (scaled[0], scaled[1], scaled[2])
+    w_mm, h_mm, d_mm = (float(num) for num in numbers[:3])
+    return (w_mm, h_mm, d_mm)
 
 
 def _detect_light(value: Any) -> int:
@@ -153,7 +140,12 @@ def import_excel(recreate: bool = False) -> int:
             dims_value = _get_value(row, mapping.get("dims_col"))
             desc_value = _get_value(row, mapping.get("desc_col"))
 
-            if _is_empty(type_value) and _is_empty(desc_value):
+            if not is_meaningful_text(type_value) and not is_meaningful_text(
+                desc_value
+            ):
+                continue
+
+            if str(type_value).strip().lower() == "nan":
                 continue
 
             w_mm, h_mm, d_mm = _parse_dimensions(dims_value)
@@ -230,6 +222,15 @@ def _is_empty(value: Any) -> bool:
     return _normalize_text(value) is None
 
 
+def is_meaningful_text(value: Any) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    return text.lower() != "nan"
+
+
 def _format_dims(w_mm: float | None, h_mm: float | None, d_mm: float | None) -> str:
     dims = [val for val in (w_mm, h_mm, d_mm) if val is not None]
     if not dims:
@@ -259,6 +260,7 @@ def sample_items(limit: int) -> None:
     rows = cursor.fetchall()
     conn.close()
 
+    print(f"sample rows: {len(rows)}")
     for item_type, w_mm, h_mm, d_mm, price, light, sheet, row in rows:
         dims = _format_dims(w_mm, h_mm, d_mm)
         light_flag = "yes" if light else "no"
