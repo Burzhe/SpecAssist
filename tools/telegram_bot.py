@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import ADMIN_IDS, BOT_TOKEN, UPLOAD_DIR
+from config import ADMIN_IDS, BOT_TOKEN, MAX_TG_FILE_MB, UPLOAD_DIR
 from tools.db import get_connection, get_meta, list_versions, set_meta
 from tools.importer import import_workbook
 from tools.search import ParsedQuery, search_items, search_items_with_params
@@ -133,6 +133,21 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     UPLOAD_STATE.clear_pending(user_id)
 
     doc = update.message.document
+    if doc.file_size:
+        limit_bytes = MAX_TG_FILE_MB * 1024 * 1024
+        if doc.file_size > limit_bytes:
+            size_mb = doc.file_size / 1024 / 1024
+            await send_split_message(
+                context,
+                update.effective_chat.id,
+                "File is too big ({size:.1f} MB). Limit is {limit} MB.\n"
+                "Please compress to .zip, split the file, or place it into data/uploads/ "
+                "and use /reindex <path> (admin only).".format(
+                    size=size_mb,
+                    limit=MAX_TG_FILE_MB,
+                ),
+            )
+            return
     await send_split_message(context, update.effective_chat.id, "Download ok. Processing...")
     file = await context.bot.get_file(doc.file_id)
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
@@ -185,10 +200,18 @@ async def versions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     versions = list_versions(conn)
     active = get_meta(conn, "active_version")
     conn.close()
-    if not versions:
-        await send_split_message(context, update.effective_chat.id, "No versions imported yet.")
+    if not active and not versions:
+        await send_split_message(
+            context,
+            update.effective_chat.id,
+            "No active version. Upload Excel via /upload or run /reindex <path>",
+        )
         return
-    lines = ["Versions:"]
+    lines = []
+    if not active:
+        lines.append("No active version. Upload Excel via /upload or run /reindex <path>")
+        lines.append("")
+    lines.append("Versions:")
     for version in versions:
         marker = " (active)" if version == active else ""
         lines.append(f"- {version}{marker}")
@@ -221,7 +244,11 @@ async def reindex_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     active = get_meta(conn, "active_version")
     if not active:
         conn.close()
-        await send_split_message(context, update.effective_chat.id, "No active version set.")
+        await send_split_message(
+            context,
+            update.effective_chat.id,
+            "No active version. Upload Excel via /upload or run /reindex <path>",
+        )
         return
     path = get_meta(conn, f"version_path:{active}")
     conn.close()
@@ -769,6 +796,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    LOGGER.exception("Unhandled error in Telegram bot", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await send_split_message(
+                context,
+                update.effective_chat.id,
+                "Something went wrong. Please try again later.",
+            )
+        except Exception:
+            LOGGER.exception("Failed to send error message to user.")
+
+
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set")
@@ -783,6 +823,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("reindex", reindex_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    app.add_error_handler(error_handler)
     return app
 
 
