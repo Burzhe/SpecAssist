@@ -246,15 +246,15 @@ def _format_dims(w_mm: float | None, h_mm: float | None, d_mm: float | None) -> 
 def sample_items(limit: int) -> None:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
-        \"\"\"
-        SELECT item_type, w_mm, h_mm, d_mm, price, light, source_sheet, source_row
-        FROM items
-        WHERE price IS NOT NULL AND price > 0
-          AND (w_mm IS NOT NULL OR h_mm IS NOT NULL OR d_mm IS NOT NULL)
-        ORDER BY id
-        LIMIT ?
-        \"\"\",
-        (limit,),
+        """
+    SELECT item_type, w_mm, h_mm, d_mm, price, light, source_sheet, source_row
+    FROM items
+    WHERE price IS NOT NULL AND price > 0
+      AND (w_mm IS NOT NULL OR h_mm IS NOT NULL OR d_mm IS NOT NULL)
+    ORDER BY id
+    LIMIT ?
+    """,
+    (limit,),
     )
     rows = cursor.fetchall()
     conn.close()
