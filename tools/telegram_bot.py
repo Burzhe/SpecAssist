@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -73,23 +74,32 @@ def is_authorized(user_id: int | None) -> bool:
     return allowed
 
 
-async def _send_startup_summary(app: Application) -> None:
-    if not ADMIN_IDS:
-        return
+def _get_admin_summary_message() -> str:
     conn = get_connection()
     valid_items = int(get_meta(conn, "stats:valid_items") or 0)
     skipped_rows = int(get_meta(conn, "stats:skipped_rows") or 0)
     sheets_total = int(get_meta(conn, "stats:sheets_total") or 0)
     sheets_problematic = int(get_meta(conn, "stats:sheets_problematic") or 0)
     conn.close()
-    message = _build_admin_summary_message(
+    return _build_admin_summary_message(
         sheets_total=sheets_total,
         valid_items=valid_items,
         skipped_rows=skipped_rows,
         sheets_problematic=sheets_problematic,
     )
+
+
+async def _send_startup_summary(app: Application) -> None:
+    if not ADMIN_IDS:
+        return
+    message = _get_admin_summary_message()
     for admin_id in ADMIN_IDS:
-        await app.bot.send_message(chat_id=admin_id, text=message)
+        try:
+            await app.bot.send_message(chat_id=admin_id, text=message)
+        except Forbidden:
+            LOGGER.warning("Cannot send startup summary to admin %s: forbidden", admin_id)
+        except Exception:
+            LOGGER.exception("Failed to send startup summary to admin %s", admin_id)
 
 
 def _build_admin_summary_message(
@@ -133,6 +143,25 @@ def send_admin_import_summary(result: dict) -> None:
     asyncio.run(_send_admin_message(message))
 
 
+def _build_admin_start_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("Поиск", callback_data="a:search")],
+        [
+            InlineKeyboardButton("Статус", callback_data="a:status"),
+            InlineKeyboardButton("Очистить фильтры", callback_data="a:clear"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_admin_summary(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> None:
+    message = _get_admin_summary_message()
+    await send_split_message(context, chat_id, message)
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -145,13 +174,36 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"Ваш user_id: {user_id}",
         )
         return
+    is_admin_user = is_admin(user_id)
+    message = (
+        "SpecAssist — поиск по базе Excel.\n"
+        "Просто отправьте текстовый запрос.\n"
+        "Для подсказок: /help."
+    )
+    if is_admin_user:
+        message = (
+            "SpecAssist — поиск по базе Excel.\n"
+            "Просто отправьте текстовый запрос.\n"
+            "Для подсказок: /help.\n\n"
+            "Команды администратора: /status, /users, /allow, /deny, /versions, /use, /reindex."
+        )
     await send_split_message(
         context,
         update.effective_chat.id,
-        "SpecAssist — поиск по базе Excel.\n"
-        "Просто отправьте текстовый запрос.\n"
-        "Для подсказок: /help.",
+        message,
+        reply_markup=_build_admin_start_keyboard() if is_admin_user else None,
     )
+    if is_admin_user:
+        await _send_admin_summary(context, update.effective_chat.id)
+
+
+async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    if not is_admin(update.effective_user.id if update.effective_user else None):
+        await send_split_message(context, update.effective_chat.id, "Нет доступа.")
+        return
+    await _send_admin_summary(context, update.effective_chat.id)
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -843,12 +895,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Нет доступа. Обратитесь к администратору.",
         )
         return
+    action = query.data or ""
+    if action == "a:search":
+        await send_split_message(context, chat_id, "Отправьте текстовый запрос для поиска.")
+        return
+    if action == "a:status":
+        if not is_admin(user_id):
+            await send_split_message(context, chat_id, "Нет доступа.")
+            return
+        await _send_admin_summary(context, chat_id)
+        return
+    if action == "a:clear":
+        state = SEARCH_STATE.get(chat_id)
+        if state is None:
+            await send_split_message(context, chat_id, "Фильтры уже сброшены.")
+            return
+        state.flags = {key: None for key in state.flags}
+        state.price_min = None
+        state.price_max = None
+        state.offset = 0
+        state.limit = PAGE_SIZE
+        await send_split_message(context, chat_id, "Фильтры сброшены.")
+        return
+
     state = SEARCH_STATE.get(chat_id)
     if state is None:
         await send_split_message(context, chat_id, "Состояние поиска устарело. Повторите запрос.")
         return
-
-    action = query.data or ""
     in_refine_menu = bool(query.message and query.message.text and "Уточните фильтры" in query.message.text)
     if action.startswith("s:desc:"):
         item_id = int(action.split(":")[2])
@@ -1047,6 +1120,7 @@ def build_app() -> Application:
         raise RuntimeError("BOT_TOKEN not set")
     app = Application.builder().token(BOT_TOKEN).post_init(_send_startup_summary).build()
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("s", search_handler))
     app.add_handler(CommandHandler("users", users_handler))
