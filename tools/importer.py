@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,7 @@ MATERIAL_KEYWORDS = (
 
 DIM_PATTERN = re.compile(r"\d{2,5}\s*[x×*х]\s*\d{2,5}\s*[x×*х]\s*\d{2,5}", re.IGNORECASE)
 HEADER_SCAN_ROWS = 50
+LOGGER = logging.getLogger(__name__)
 
 
 def compute_source_version(path: Path) -> str:
@@ -71,6 +73,7 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
     total_inserted = 0
     detected_sheets = 0
     skipped_sheets = 0
+    skipped_rows = 0
 
     for sheet_name in sheet_names:
         header_row = detect_header_row(path, sheet_name)
@@ -89,6 +92,11 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
             mapping, confidence, stats = detect_sheet_mapping(sample_df)
             stats["header_row"] = header_row + 1
             detected = int(confidence >= 0.35 and mapping.get("name_col") is not None)
+        LOGGER.info(
+            "Detected sheet mapping: %s -> %s",
+            sheet_name,
+            _format_mapping_for_log(mapping),
+        )
         conn.execute(
             """
             INSERT INTO sheet_schemas (source_version, sheet_name, detected, confidence, map_json)
@@ -118,6 +126,7 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
             source_row = header_row + 2 + row_idx
             parsed = parse_row(row, mapping, source_version, sheet_name, source_row)
             if parsed is None:
+                skipped_rows += 1
                 continue
             rows_to_insert.append(parsed)
         if rows_to_insert:
@@ -125,10 +134,17 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
             total_inserted += len(rows_to_insert)
 
     rebuild_fts(conn)
+    stats = _compute_import_stats(conn, source_version)
     set_meta(conn, "active_version", source_version)
     set_meta(conn, f"version_path:{source_version}", str(path))
     set_meta(conn, "last_import_at", datetime.utcnow().isoformat())
     set_meta(conn, "default_tol_mm", str(DEFAULT_TOL_MM))
+    set_meta(conn, "stats:total_items", str(stats["total_items"]))
+    set_meta(conn, "stats:valid_items", str(stats["valid_items"]))
+    set_meta(conn, "stats:sheets_detected", str(detected_sheets))
+    set_meta(conn, "stats:skipped_rows", str(skipped_rows))
+    set_meta(conn, "stats:rows_with_price_unit", str(stats["rows_with_price_unit"]))
+    set_meta(conn, "stats:rows_with_total_and_qty", str(stats["rows_with_total_and_qty"]))
 
     return {
         "source_version": source_version,
@@ -136,6 +152,8 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
         "detected_sheets": detected_sheets,
         "skipped_sheets": skipped_sheets,
         "total_sheets": len(sheet_names),
+        "skipped_rows": skipped_rows,
+        "stats": stats,
     }
 
 
@@ -161,45 +179,30 @@ def detect_header_row(path: Path, sheet_name: str) -> int | None:
 
 def detect_sheet_mapping(df: pd.DataFrame) -> tuple[dict[str, Hashable | None], float, dict[str, Any]]:
     stats: dict[str, Any] = {}
-    scores: dict[str, dict[int, float]] = {
-        "dims": {},
-        "qty": {},
-        "price": {},
-        "name": {},
-        "desc": {},
+    mapping: dict[str, Hashable | None] = {
+        "name_col": None,
+        "dims_col": None,
+        "desc_col": None,
+        "qty_col": None,
+        "unit_col": None,
+        "price_material_col": None,
+        "price_install_col": None,
+        "price_unit_col": None,
+        "total_col": None,
+        "comment_col": None,
     }
 
     for col in df.columns:
-        series = df[col]
-        col_stats = analyze_column(series)
-        stats[str(col)] = col_stats
-        scores["dims"][col] = col_stats["dims_score"]
-        scores["qty"][col] = col_stats["qty_score"]
-        scores["price"][col] = col_stats["price_score"]
-        scores["name"][col] = col_stats["name_score"]
-        scores["desc"][col] = col_stats["desc_score"]
+        normalized = _normalize_header_text(col)
+        stats[str(col)] = {"normalized": normalized}
+        canonical = _match_header_to_field(normalized)
+        if canonical is None:
+            continue
+        key = f"{canonical}_col"
+        if mapping.get(key) is None:
+            mapping[key] = col
 
-    mapping: dict[str, Hashable | None] = {
-        "dims_col": _best_col(scores["dims"]),
-        "qty_col": _best_col(scores["qty"]),
-        "price_unit_col": None,
-        "price_total_col": None,
-        "name_col": _best_col(scores["name"]),
-        "desc_col": _best_col(scores["desc"]),
-    }
-
-    price_sorted = sorted(scores["price"].items(), key=lambda item: item[1], reverse=True)
-    if price_sorted:
-        mapping["price_unit_col"] = price_sorted[0][0]
-    if len(price_sorted) > 1:
-        mapping["price_total_col"] = price_sorted[1][0]
-
-    name_score = scores["name"].get(mapping["name_col"], 0.0) if mapping["name_col"] is not None else 0.0
-    dims_score = scores["dims"].get(mapping["dims_col"], 0.0) if mapping["dims_col"] is not None else 0.0
-    price_score = scores["price"].get(mapping["price_unit_col"], 0.0) if mapping["price_unit_col"] is not None else 0.0
-    desc_score = scores["desc"].get(mapping["desc_col"], 0.0) if mapping["desc_col"] is not None else 0.0
-
-    confidence = min(1.0, (name_score + max(dims_score, price_score) + (desc_score * 0.5)) / 2.2)
+    confidence = 1.0 if mapping.get("name_col") is not None else 0.0
     return mapping, confidence, stats
 
 
@@ -273,12 +276,16 @@ def analyze_column(series: pd.Series) -> dict[str, float]:
 def _empty_mapping() -> tuple[dict[str, Hashable | None], float, dict[str, Any]]:
     return (
         {
-            "dims_col": None,
-            "qty_col": None,
-            "price_unit_col": None,
-            "price_total_col": None,
             "name_col": None,
+            "dims_col": None,
             "desc_col": None,
+            "qty_col": None,
+            "unit_col": None,
+            "price_material_col": None,
+            "price_install_col": None,
+            "price_unit_col": None,
+            "total_col": None,
+            "comment_col": None,
         },
         0.0,
         {},
@@ -287,17 +294,48 @@ def _empty_mapping() -> tuple[dict[str, Hashable | None], float, dict[str, Any]]
 
 def _normalize_header_text(value: Any) -> str:
     text = str(value).strip().lower().replace("ё", "е")
-    return re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _match_header_to_field(normalized: str) -> str | None:
+    if not normalized or normalized == "nan":
+        return None
+    if "артикул" in normalized:
+        return None
+    has_price = "цена" in normalized
+    if "итого" in normalized:
+        return "total"
+    if "наимен" in normalized:
+        return "name"
+    if "размер" in normalized or "шхгхв" in normalized:
+        return "dims"
+    if "материал" in normalized or "описан" in normalized:
+        return "desc"
+    if "колво" in normalized or "кол" in normalized:
+        return "qty"
+    if "комментар" in normalized:
+        return "comment"
+    if "ед" in normalized and ("изм" in normalized or "едизм" in normalized) and not has_price:
+        return "unit"
+    if has_price and "материал" in normalized:
+        return "price_material"
+    if has_price and ("монтаж" in normalized or "достав" in normalized):
+        return "price_install"
+    if has_price and ("издел" in normalized or ("ед" in normalized and "изм" in normalized)):
+        return "price_unit"
+    return None
 
 
 def _is_header_match(values: list[Any], normalized: list[str]) -> bool:
     normalized_clean = [text for text in normalized if text and text != "nan"]
-    has_name = any("наименование" in text for text in normalized_clean)
+    has_name = any("наимен" in text for text in normalized_clean)
     has_position = any(
         "позиция" in text or "№" in str(raw) for raw, text in zip(values, normalized)
     )
     has_price_qty = any(
-        any(token in text for token in ("кол-во", "кол во", "итого", "цена"))
+        any(token in text for token in ("кол", "итого", "цена"))
         for text in normalized_clean
     )
     return has_name and has_position and has_price_qty
@@ -332,8 +370,17 @@ def parse_row(
 
     qty = _to_float(_get_value(row, mapping.get("qty_col")))
     price_unit_val = _get_value(row, mapping.get("price_unit_col"))
-    price_total_val = _get_value(row, mapping.get("price_total_col"))
-    price_unit_ex_vat, price_total_ex_vat = _extract_price(price_unit_val, price_total_val, qty)
+    price_material_val = _get_value(row, mapping.get("price_material_col"))
+    price_install_val = _get_value(row, mapping.get("price_install_col"))
+    price_total_val = _get_value(row, mapping.get("total_col"))
+    price_total_ex_vat = _to_float(price_total_val)
+    price_unit_ex_vat = compute_unit_price(
+        price_unit=price_unit_val,
+        price_material=price_material_val,
+        price_install=price_install_val,
+        total=price_total_ex_vat,
+        qty=qty,
+    )
 
     if _is_invalid_row(name, description, qty, price_unit_ex_vat, price_total_ex_vat):
         return None
@@ -428,19 +475,24 @@ def _parse_dimensions(value: Any) -> tuple[int | None, int | None, int | None]:
     return (w_mm, d_mm, h_mm)
 
 
-def _extract_price(
-    price_unit_value: Any,
-    price_total_value: Any,
-    qty_value: float | None,
-) -> tuple[float | None, float | None]:
-    price_unit = _to_float(price_unit_value)
-    price_total = _to_float(price_total_value)
-
-    if price_unit and price_unit > 0:
-        return (price_unit, price_total)
-    if price_total and qty_value and qty_value > 0:
-        return (price_total / qty_value, price_total)
-    return (price_unit, price_total)
+def compute_unit_price(
+    *,
+    price_unit: Any,
+    price_material: Any,
+    price_install: Any,
+    total: float | None,
+    qty: float | None,
+) -> float | None:
+    unit_value = _to_float(price_unit)
+    if unit_value is not None and unit_value > 0:
+        return unit_value
+    material_value = _to_float(price_material)
+    install_value = _to_float(price_install)
+    if material_value is not None or install_value is not None:
+        return (material_value or 0.0) + (install_value or 0.0)
+    if total is not None and qty is not None and qty > 0:
+        return total / qty
+    return None
 
 
 def _normalize_for_flags(text: str) -> str:
@@ -476,6 +528,50 @@ def _looks_like_header(name: str) -> bool:
         "номер",
     )
     return any(token in lowered for token in header_tokens)
+
+
+def _format_mapping_for_log(mapping: dict[str, Hashable | None]) -> dict[str, str | None]:
+    formatted: dict[str, str | None] = {}
+    for key, value in mapping.items():
+        canonical = key.replace("_col", "")
+        formatted[canonical] = None if value is None else str(value)
+    return formatted
+
+
+def _compute_import_stats(conn, source_version: str) -> dict[str, int]:
+    total_items = conn.execute(
+        "SELECT COUNT(*) FROM items WHERE source_version = ?",
+        (source_version,),
+    ).fetchone()[0]
+    valid_items = conn.execute(
+        "SELECT COUNT(*) FROM items WHERE source_version = ? AND is_valid = 1",
+        (source_version,),
+    ).fetchone()[0]
+    rows_with_price_unit = conn.execute(
+        """
+        SELECT COUNT(*) FROM items
+        WHERE source_version = ?
+          AND price_unit_ex_vat IS NOT NULL
+          AND price_unit_ex_vat > 0
+        """,
+        (source_version,),
+    ).fetchone()[0]
+    rows_with_total_and_qty = conn.execute(
+        """
+        SELECT COUNT(*) FROM items
+        WHERE source_version = ?
+          AND price_total_ex_vat IS NOT NULL
+          AND qty IS NOT NULL
+          AND qty > 0
+        """,
+        (source_version,),
+    ).fetchone()[0]
+    return {
+        "total_items": int(total_items),
+        "valid_items": int(valid_items),
+        "rows_with_price_unit": int(rows_with_price_unit),
+        "rows_with_total_and_qty": int(rows_with_total_and_qty),
+    }
 
 
 def _is_invalid_row(
