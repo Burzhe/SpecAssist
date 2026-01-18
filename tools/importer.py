@@ -21,11 +21,21 @@ NAME_KEYWORDS = (
     "кровать",
     "панел",
     "двер",
+    "стол",
+    "бенч",
+    "бар",
+    "перил",
+    "зеркал",
+    "поручн",
+    "перегород",
+    "витрин",
+    "ресепшн",
 )
 
 MATERIAL_KEYWORDS = (
     "лдсп",
     "egger",
+    "ламинирован",
     "мдф",
     "mdf",
     "шпон",
@@ -35,6 +45,8 @@ MATERIAL_KEYWORDS = (
     "металл",
     "нерж",
     "сталь",
+    "алюм",
+    "порошк",
 )
 
 DIM_PATTERN = re.compile(r"\d{2,5}\s*[x×*х]\s*\d{2,5}\s*[x×*х]\s*\d{2,5}", re.IGNORECASE)
@@ -261,16 +273,19 @@ def parse_row(
     price_total_val = _get_value(row, mapping.get("price_total_col"))
     price_unit_ex_vat, price_total_ex_vat = _extract_price(price_unit_val, price_total_val, qty)
 
+    if _is_too_short(name, description, w_mm, d_mm, h_mm, price_unit_ex_vat, price_total_ex_vat):
+        return None
+
     if not _has_signal(name, description, w_mm, d_mm, h_mm, price_unit_ex_vat, price_total_ex_vat):
         return None
 
     flags_text = f"{name or ''} {description or ''}".lower()
     has_led = int(any(token in flags_text for token in ("подсвет", "led", "лента")))
-    mat_ldsp = int(any(token in flags_text for token in ("лдсп", "egger")))
+    mat_ldsp = int(any(token in flags_text for token in ("лдсп", "egger", "ламинирован")))
     mat_mdf = int(any(token in flags_text for token in ("мдф", "mdf")))
     mat_veneer = int(any(token in flags_text for token in ("шпон", "veneer")))
     has_glass = int(any(token in flags_text for token in ("стекл", "зеркал")))
-    has_metal = int(any(token in flags_text for token in ("металл", "нерж", "сталь")))
+    has_metal = int(any(token in flags_text for token in ("металл", "нерж", "сталь", "алюм", "порошк")))
 
     raw_json = json.dumps(row.to_dict(), ensure_ascii=False)
 
@@ -378,3 +393,21 @@ def _has_signal(
     if price_unit or price_total:
         return True
     return False
+
+
+def _is_too_short(
+    name: str | None,
+    description: str | None,
+    w_mm: int | None,
+    d_mm: int | None,
+    h_mm: int | None,
+    price_unit: float | None,
+    price_total: float | None,
+    min_length: int = 6,
+) -> bool:
+    if any(val is not None for val in (w_mm, d_mm, h_mm)):
+        return False
+    if price_unit or price_total:
+        return False
+    text = f"{name or ''} {description or ''}".strip()
+    return len(text) < min_length

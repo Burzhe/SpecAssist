@@ -28,6 +28,15 @@ ITEM_COLUMNS: dict[str, str] = {
     "raw_json": "TEXT",
 }
 
+ALLOWED_USER_COLUMNS: dict[str, str] = {
+    "user_id": "INTEGER PRIMARY KEY",
+    "username": "TEXT",
+    "first_name": "TEXT",
+    "last_name": "TEXT",
+    "added_by": "INTEGER",
+    "added_at": "TEXT",
+}
+
 
 def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -39,6 +48,7 @@ def get_connection() -> sqlite3.Connection:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_table(conn, "items", ITEM_COLUMNS)
+    _ensure_table(conn, "allowed_users", ALLOWED_USER_COLUMNS)
     _ensure_table(
         conn,
         "sheet_schemas",
@@ -175,3 +185,51 @@ def insert_items(
         rows,
     )
     conn.commit()
+
+
+def is_allowed_user(conn: sqlite3.Connection, user_id: int) -> bool:
+    cursor = conn.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
+    return cursor.fetchone() is not None
+
+
+def list_allowed_users(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    cursor = conn.execute(
+        """
+        SELECT user_id, username, first_name, last_name, added_by, added_at
+        FROM allowed_users
+        ORDER BY added_at DESC
+        """
+    )
+    return cursor.fetchall()
+
+
+def add_allowed_user(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    username: str | None,
+    first_name: str | None,
+    last_name: str | None,
+    added_by: int | None,
+    added_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO allowed_users(user_id, username, first_name, last_name, added_by, added_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_name=excluded.last_name,
+            added_by=excluded.added_by,
+            added_at=excluded.added_at
+        """,
+        (user_id, username, first_name, last_name, added_by, added_at),
+    )
+    conn.commit()
+
+
+def remove_allowed_user(conn: sqlite3.Connection, user_id: int) -> bool:
+    cursor = conn.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+    conn.commit()
+    return cursor.rowcount > 0
