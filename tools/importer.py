@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Hashable, Iterable
 
 import pandas as pd
 
@@ -45,6 +45,7 @@ MATERIAL_KEYWORDS = (
 )
 
 DIM_PATTERN = re.compile(r"\d{2,5}\s*[x×*х]\s*\d{2,5}\s*[x×*х]\s*\d{2,5}", re.IGNORECASE)
+HEADER_SCAN_ROWS = 50
 
 
 def compute_source_version(path: Path) -> str:
@@ -72,15 +73,22 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
     skipped_sheets = 0
 
     for sheet_name in sheet_names:
-        sample_df = pd.read_excel(
-            path,
-            sheet_name=sheet_name,
-            header=None,
-            nrows=300,
-            engine="openpyxl",
-        )
-        mapping, confidence, stats = detect_sheet_mapping(sample_df)
-        detected = int(confidence >= 0.35 and mapping.get("name_col") is not None)
+        header_row = detect_header_row(path, sheet_name)
+        if header_row is None:
+            mapping, confidence, stats = _empty_mapping()
+            stats["header_row"] = None
+            detected = 0
+        else:
+            sample_df = pd.read_excel(
+                path,
+                sheet_name=sheet_name,
+                header=header_row,
+                nrows=300,
+                engine="openpyxl",
+            )
+            mapping, confidence, stats = detect_sheet_mapping(sample_df)
+            stats["header_row"] = header_row + 1
+            detected = int(confidence >= 0.35 and mapping.get("name_col") is not None)
         conn.execute(
             """
             INSERT INTO sheet_schemas (source_version, sheet_name, detected, confidence, map_json)
@@ -101,10 +109,14 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
             continue
 
         detected_sheets += 1
-        df = pd.read_excel(path, sheet_name=sheet_name, header=None, engine="openpyxl")
+        if header_row is None:
+            skipped_sheets += 1
+            continue
+        df = pd.read_excel(path, sheet_name=sheet_name, header=header_row, engine="openpyxl")
         rows_to_insert: list[tuple] = []
         for row_idx, row in df.iterrows():
-            parsed = parse_row(row, mapping, source_version, sheet_name, row_idx + 1)
+            source_row = header_row + 2 + row_idx
+            parsed = parse_row(row, mapping, source_version, sheet_name, source_row)
             if parsed is None:
                 continue
             rows_to_insert.append(parsed)
@@ -127,7 +139,27 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
     }
 
 
-def detect_sheet_mapping(df: pd.DataFrame) -> tuple[dict[str, int | None], float, dict[str, Any]]:
+def detect_header_row(path: Path, sheet_name: str) -> int | None:
+    preview = pd.read_excel(
+        path,
+        sheet_name=sheet_name,
+        header=None,
+        nrows=HEADER_SCAN_ROWS,
+        engine="openpyxl",
+    )
+    for row_idx, row in preview.iterrows():
+        values = [value for value in row.tolist() if value is not None]
+        if not values:
+            continue
+        normalized = [_normalize_header_text(value) for value in values]
+        if not any(text and text != "nan" for text in normalized):
+            continue
+        if _is_header_match(values, normalized):
+            return int(row_idx)
+    return None
+
+
+def detect_sheet_mapping(df: pd.DataFrame) -> tuple[dict[str, Hashable | None], float, dict[str, Any]]:
     stats: dict[str, Any] = {}
     scores: dict[str, dict[int, float]] = {
         "dims": {},
@@ -147,7 +179,7 @@ def detect_sheet_mapping(df: pd.DataFrame) -> tuple[dict[str, int | None], float
         scores["name"][col] = col_stats["name_score"]
         scores["desc"][col] = col_stats["desc_score"]
 
-    mapping: dict[str, int | None] = {
+    mapping: dict[str, Hashable | None] = {
         "dims_col": _best_col(scores["dims"]),
         "qty_col": _best_col(scores["qty"]),
         "price_unit_col": None,
@@ -238,7 +270,40 @@ def analyze_column(series: pd.Series) -> dict[str, float]:
     }
 
 
-def _best_col(score_map: dict[int, float]) -> int | None:
+def _empty_mapping() -> tuple[dict[str, Hashable | None], float, dict[str, Any]]:
+    return (
+        {
+            "dims_col": None,
+            "qty_col": None,
+            "price_unit_col": None,
+            "price_total_col": None,
+            "name_col": None,
+            "desc_col": None,
+        },
+        0.0,
+        {},
+    )
+
+
+def _normalize_header_text(value: Any) -> str:
+    text = str(value).strip().lower().replace("ё", "е")
+    return re.sub(r"\s+", " ", text)
+
+
+def _is_header_match(values: list[Any], normalized: list[str]) -> bool:
+    normalized_clean = [text for text in normalized if text and text != "nan"]
+    has_name = any("наименование" in text for text in normalized_clean)
+    has_position = any(
+        "позиция" in text or "№" in str(raw) for raw, text in zip(values, normalized)
+    )
+    has_price_qty = any(
+        any(token in text for token in ("кол-во", "кол во", "итого", "цена"))
+        for text in normalized_clean
+    )
+    return has_name and has_position and has_price_qty
+
+
+def _best_col(score_map: dict[Hashable, float]) -> Hashable | None:
     if not score_map:
         return None
     best_col, best_score = max(score_map.items(), key=lambda item: item[1])
@@ -249,7 +314,7 @@ def _best_col(score_map: dict[int, float]) -> int | None:
 
 def parse_row(
     row: pd.Series,
-    mapping: dict[str, int | None],
+    mapping: dict[str, Hashable | None],
     source_version: str,
     sheet_name: str,
     source_row: int,
@@ -258,8 +323,6 @@ def parse_row(
     description = _normalize_text(_get_value(row, mapping.get("desc_col")))
 
     if not name:
-        return None
-    if _is_service_row(name):
         return None
 
     dims_raw = _get_value(row, mapping.get("dims_col"))
@@ -272,7 +335,7 @@ def parse_row(
     price_total_val = _get_value(row, mapping.get("price_total_col"))
     price_unit_ex_vat, price_total_ex_vat = _extract_price(price_unit_val, price_total_val, qty)
 
-    if _should_skip_row(name, description, qty, price_unit_ex_vat, price_total_ex_vat):
+    if _is_invalid_row(name, description, qty, price_unit_ex_vat, price_total_ex_vat):
         return None
 
     if not _has_signal(name, description, w_mm, d_mm, h_mm, price_unit_ex_vat, price_total_ex_vat):
@@ -310,7 +373,7 @@ def parse_row(
     )
 
 
-def _get_value(row: pd.Series, col: int | None) -> Any:
+def _get_value(row: pd.Series, col: Hashable | None) -> Any:
     if col is None:
         return None
     return row.get(col)
@@ -320,7 +383,10 @@ def _normalize_text(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
-    if not text or text.lower() == "nan":
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered == "nan" or lowered == "-":
         return None
     return text
 
@@ -392,34 +458,40 @@ def _extract_prefixed_dim(text: str, stems: tuple[str, ...]) -> int | None:
     return None
 
 
-def _is_service_row(name: str) -> bool:
+def _looks_like_header(name: str) -> bool:
     lowered = _normalize_for_flags(name)
-    return any(
-        token in lowered
-        for token in (
-            "наименование",
-            "описание",
-            "итого",
-            "итог",
-            "количество",
-            "кол-во",
-            "шт",
-            "ед",
-        )
+    header_tokens = (
+        "наименование",
+        "материал",
+        "материалы",
+        "описание",
+        "ед изм",
+        "единиц",
+        "кол во",
+        "количество",
+        "цена",
+        "итого",
+        "стоимость",
+        "позиция",
+        "номер",
     )
+    return any(token in lowered for token in header_tokens)
 
 
-def _should_skip_row(
+def _is_invalid_row(
     name: str,
     description: str | None,
     qty: float | None,
     price_unit: float | None,
     price_total: float | None,
 ) -> bool:
-    if price_unit or price_total or qty:
-        return False
-    desc_len = len(description.strip()) if description else 0
-    return desc_len < 10 and len(name.strip()) < 5
+    if name.strip().lower() in {"nan", "-"}:
+        return True
+    if _looks_like_header(name) and not (qty or price_unit or price_total):
+        return True
+    if not description and not (qty or price_unit or price_total):
+        return True
+    return False
 
 
 def _has_signal(

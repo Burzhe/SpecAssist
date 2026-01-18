@@ -89,7 +89,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context,
         update.effective_chat.id,
         "SpecAssist — поиск по базе Excel.\n"
-        "Просто отправьте текстовый запрос или используйте /s.\n"
+        "Просто отправьте текстовый запрос.\n"
         "Для подсказок: /help.",
     )
 
@@ -793,7 +793,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if action.startswith("s:desc:"):
         item_id = int(action.split(":")[2])
         conn = get_connection()
-        row = conn.execute("SELECT name, description FROM items WHERE id = ?", (item_id,)).fetchone()
+        row = conn.execute(
+            "SELECT name, description FROM items WHERE id = ? AND is_valid = 1",
+            (item_id,),
+        ).fetchone()
         conn.close()
         if not row:
             await send_split_message(context, chat_id, "Описание не найдено.")
@@ -805,7 +808,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if action.startswith("s:similar:"):
         item_id = int(action.split(":")[2])
         conn = get_connection()
-        row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM items WHERE id = ? AND is_valid = 1",
+            (item_id,),
+        ).fetchone()
         if not row:
             conn.close()
             await send_split_message(context, chat_id, "Элемент не найден.")

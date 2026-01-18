@@ -25,6 +25,7 @@ ITEM_COLUMNS: dict[str, str] = {
     "mat_veneer": "INTEGER",
     "has_glass": "INTEGER",
     "has_metal": "INTEGER",
+    "is_valid": "INTEGER DEFAULT 1",
     "raw_json": "TEXT",
 }
 
