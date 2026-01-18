@@ -52,7 +52,7 @@ def search_items(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
 
     tol = DEFAULT_TOL_MM
     keywords = parsed.keywords
-    flags = parsed.flags.copy()
+    flags = _normalize_flag_filters(parsed.flags)
     relax_steps: list[str] = []
 
     results = _run_search(conn, active_version, parsed, tol, keywords, flags)
@@ -66,11 +66,11 @@ def search_items(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
             if results:
                 break
 
-    if len(results) < MAX_RESULTS and any(flags.values()):
+    if len(results) < MAX_RESULTS and any(value is True for value in flags.values()):
         drop_order = ["has_glass", "has_metal", "mat_veneer", "mat_mdf", "mat_ldsp", "has_led"]
         for flag in drop_order:
-            if flags.get(flag):
-                flags[flag] = False
+            if flags.get(flag) is True:
+                flags[flag] = None
                 relax_steps.append(f"drop:{flag}")
                 results = _run_search(conn, active_version, parsed, tol, keywords, flags)
                 if results:
@@ -83,7 +83,8 @@ def search_items(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
 
     if not results:
         relax_steps.append("fallback:text-only")
-        results = _run_search(conn, active_version, ParsedQuery(parsed.category, (None, None, None), flags, keywords), tol, keywords, flags)
+        parsed = ParsedQuery(parsed.category, (None, None, None), flags, keywords)
+        results = _run_search(conn, active_version, parsed, tol, keywords, flags)
 
     ranked = _rank_results(results, parsed.dims)
 
@@ -93,6 +94,49 @@ def search_items(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
         "tol": tol,
         "relaxed": relax_steps,
         "active_version": active_version,
+        "parsed": parsed,
+        "flags": flags,
+        "keywords": keywords,
+    }
+
+
+def search_items_with_params(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    parsed: ParsedQuery | None = None,
+    keywords: list[str] | None = None,
+    flags: dict[str, bool | None] | None = None,
+    tol: int | None = None,
+    price_min: float | None = None,
+    price_max: float | None = None,
+    limit: int = MAX_RESULTS,
+    offset: int = 0,
+) -> dict[str, Any]:
+    parsed = parsed or parse_query(query)
+    keywords = keywords or parsed.keywords
+    flag_filters = _normalize_flag_filters(parsed.flags, flags)
+    tol = tol if tol is not None else DEFAULT_TOL_MM
+    active_version = get_meta(conn, "active_version")
+    rows = _run_search(
+        conn,
+        active_version,
+        parsed,
+        tol,
+        keywords,
+        flag_filters,
+        price_min=price_min,
+        price_max=price_max,
+    )
+    ranked = _rank_results(rows, parsed.dims)
+    return {
+        "results": ranked[offset : offset + limit],
+        "total": len(ranked),
+        "tol": tol,
+        "active_version": active_version,
+        "parsed": parsed,
+        "flags": flag_filters,
+        "keywords": keywords,
     }
 
 
@@ -102,7 +146,10 @@ def _run_search(
     parsed: ParsedQuery,
     tol: int,
     keywords: list[str],
-    flags: dict[str, bool],
+    flags: dict[str, bool | None],
+    *,
+    price_min: float | None = None,
+    price_max: float | None = None,
 ) -> list[dict[str, Any]]:
     params: list[Any] = []
     where = ["1=1"]
@@ -128,8 +175,17 @@ def _run_search(
         params.extend([h_mm - tol, h_mm + tol])
 
     for flag, enabled in flags.items():
-        if enabled:
+        if enabled is True:
             where.append(f"items.{flag} = 1")
+        elif enabled is False:
+            where.append(f"items.{flag} = 0")
+
+    if price_min is not None:
+        where.append("items.price_unit_ex_vat >= ?")
+        params.append(price_min)
+    if price_max is not None:
+        where.append("items.price_unit_ex_vat <= ?")
+        params.append(price_max)
 
     if keywords:
         sql = """
@@ -155,6 +211,21 @@ def _run_search(
     for row in rows:
         results.append(dict(row))
     return results
+
+
+def _normalize_flag_filters(
+    parsed_flags: dict[str, bool],
+    overrides: dict[str, bool | None] | None = None,
+) -> dict[str, bool | None]:
+    flag_filters: dict[str, bool | None] = {
+        key: True if value else None for key, value in parsed_flags.items()
+    }
+    if overrides:
+        for key, value in overrides.items():
+            flag_filters[key] = value
+    for key in FLAG_TOKENS:
+        flag_filters.setdefault(key, None)
+    return flag_filters
 
 
 def _rank_results(rows: list[dict[str, Any]], dims: tuple[int | None, int | None, int | None]) -> list[dict[str, Any]]:
