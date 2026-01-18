@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from config import DEFAULT_TOL_MM, MAX_RESULTS
-from tools.db import get_meta
 
 CATEGORY_STEMS = {
     "шкаф": ("шкаф", "пенал", "гардероб"),
@@ -50,21 +49,20 @@ def parse_query(query: str) -> ParsedQuery:
 
 def search_items(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
     parsed = parse_query(query)
-    active_version = get_meta(conn, "active_version")
 
     tol_by_dim = _default_tol_by_dim(parsed.dims)
     keywords = parsed.keywords
     flags = _normalize_flag_filters(parsed.flags)
     relax_steps: list[str] = []
 
-    results = _run_search(conn, active_version, parsed, tol_by_dim, keywords, flags)
+    results = _run_search(conn, parsed, tol_by_dim, keywords, flags)
     if len(results) < MAX_RESULTS:
         for next_tol in (100, 200):
             if len(results) >= MAX_RESULTS or parsed.dims == (None, None, None):
                 break
             tol_by_dim = _increase_tol_by_dim(parsed.dims, tol_by_dim, next_tol)
             relax_steps.append(f"tol={next_tol}")
-            results = _run_search(conn, active_version, parsed, tol_by_dim, keywords, flags)
+            results = _run_search(conn, parsed, tol_by_dim, keywords, flags)
             if results:
                 break
 
@@ -74,19 +72,19 @@ def search_items(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
             if flags.get(flag) is True:
                 flags[flag] = None
                 relax_steps.append(f"drop:{flag}")
-                results = _run_search(conn, active_version, parsed, tol_by_dim, keywords, flags)
+                results = _run_search(conn, parsed, tol_by_dim, keywords, flags)
                 if results:
                     break
 
     if len(results) < MAX_RESULTS and keywords:
         keywords = sorted(keywords, key=len, reverse=True)[:2]
         relax_steps.append("keywords:shortened")
-        results = _run_search(conn, active_version, parsed, tol_by_dim, keywords, flags)
+        results = _run_search(conn, parsed, tol_by_dim, keywords, flags)
 
     if not results:
         relax_steps.append("fallback:text-only")
         parsed = ParsedQuery(parsed.category, (None, None, None), flags, keywords)
-        results = _run_search(conn, active_version, parsed, tol_by_dim, keywords, flags)
+        results = _run_search(conn, parsed, tol_by_dim, keywords, flags)
 
     ranked = _rank_results(results, parsed.dims)
 
@@ -95,7 +93,6 @@ def search_items(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
         "total": len(ranked),
         "tol": tol_by_dim,
         "relaxed": relax_steps,
-        "active_version": active_version,
         "parsed": parsed,
         "flags": flags,
         "keywords": keywords,
@@ -119,10 +116,8 @@ def search_items_with_params(
     keywords = keywords or parsed.keywords
     flag_filters = _normalize_flag_filters(parsed.flags, flags)
     tol_by_dim = tol_by_dim or _default_tol_by_dim(parsed.dims)
-    active_version = get_meta(conn, "active_version")
     rows = _run_search(
         conn,
-        active_version,
         parsed,
         tol_by_dim,
         keywords,
@@ -135,7 +130,6 @@ def search_items_with_params(
         "results": ranked[offset : offset + limit],
         "total": len(ranked),
         "tol": tol_by_dim,
-        "active_version": active_version,
         "parsed": parsed,
         "flags": flag_filters,
         "keywords": keywords,
@@ -144,7 +138,6 @@ def search_items_with_params(
 
 def _run_search(
     conn: sqlite3.Connection,
-    active_version: str | None,
     parsed: ParsedQuery,
     tol_by_dim: tuple[int | None, int | None, int | None],
     keywords: list[str],
@@ -155,9 +148,6 @@ def _run_search(
 ) -> list[dict[str, Any]]:
     params: list[Any] = []
     where = ["1=1", "items.is_valid = 1"]
-    if active_version:
-        where.append("items.source_version = ?")
-        params.append(active_version)
 
     if parsed.category:
         synonyms = CATEGORY_STEMS.get(parsed.category, (parsed.category,))
@@ -267,10 +257,8 @@ def find_similar(
     )
     tol_by_dim = _default_tol_by_dim(parsed.dims, multiplier=2.0)
     flags = _normalize_flag_filters(parsed.flags)
-    active_version = get_meta(conn, "active_version")
     rows = _run_search(
         conn,
-        active_version,
         parsed,
         tol_by_dim,
         keywords,

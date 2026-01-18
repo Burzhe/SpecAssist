@@ -43,6 +43,27 @@ def import_excel(path: str | None = None) -> dict:
     return result
 
 
+def reindex_with_report(path: str | None = None) -> dict:
+    result = import_excel(path)
+    _print_mapping_report(result.get("sheet_reports", []))
+    summary = result.get("summary", {})
+    if summary:
+        print("Reindex summary:")
+        print(f"  sheets_detected: {result.get('detected_sheets', 0)}")
+        print(f"  rows_scanned: {summary.get('rows_total', 0)}")
+        print(f"  rows_inserted: {summary.get('rows_inserted', 0)}")
+        print(f"  rows_skipped: {summary.get('rows_skipped', 0)}")
+        print(
+            "  rows_unit_price_from_unit: "
+            f"{summary.get('rows_unit_price_from_unit', 0)}"
+        )
+        print(
+            "  rows_unit_price_from_total_qty: "
+            f"{summary.get('rows_unit_price_from_total_qty', 0)}"
+        )
+    return result
+
+
 def sample_items(limit: int) -> None:
     conn = get_connection()
     cursor = conn.execute(
@@ -71,30 +92,7 @@ def sample_items(limit: int) -> None:
 
 
 def main(path: str | None = None) -> None:
-    result = import_excel(path)
-    _print_mapping_report(result.get("sheet_reports", []))
-    summary = result.get("summary", {})
-    if summary:
-        print("Reindex summary:")
-        print(f"  sheets_total: {summary.get('sheets_total', 0)}")
-        print(f"  sheets_ok: {summary.get('sheets_ok', 0)}")
-        print(f"  sheets_missing_price_unit: {summary.get('sheets_missing_price_unit', 0)}")
-        print(f"  sheets_missing_qty: {summary.get('sheets_missing_qty', 0)}")
-        print(f"  rows_total: {summary.get('rows_total', 0)}")
-        print(f"  rows_inserted: {summary.get('rows_inserted', 0)}")
-        print(f"  rows_skipped: {summary.get('rows_skipped', 0)}")
-        print(
-            "  rows_unit_price_from_price_unit: "
-            f"{summary.get('rows_unit_price_from_price_unit', 0)}"
-        )
-        print(
-            "  rows_unit_price_from_material_install: "
-            f"{summary.get('rows_unit_price_from_material_install', 0)}"
-        )
-        print(
-            "  rows_unit_price_from_total_div_qty: "
-            f"{summary.get('rows_unit_price_from_total_div_qty', 0)}"
-        )
+    result = reindex_with_report(path)
     print(
         "Imported {inserted} rows into DB, detected sheets {detected_sheets}, skipped {skipped_sheets}.".format(
             inserted=result["inserted"],
@@ -102,9 +100,6 @@ def main(path: str | None = None) -> None:
             skipped_sheets=result["skipped_sheets"],
         )
     )
-    from tools.telegram_bot import send_admin_import_summary
-
-    send_admin_import_summary(result)
 
 
 def debug_mapping(path: str, *, limit_sheets: int | None = None, max_rows_scan: int = 50) -> None:

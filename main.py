@@ -56,7 +56,7 @@ def main() -> None:
             )
             print(
                 f"- {item.get('name') or '-'} | dims={dims or '-'} | price={item.get('price_unit_ex_vat') or '-'} | "
-                f"sheet={item.get('source_sheet')} row={item.get('source_row')} | version={item.get('source_version')}"
+                f"sheet={item.get('source_sheet')} row={item.get('source_row')}"
             )
         return
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -10,8 +9,7 @@ from typing import Any, Hashable, Iterable
 
 import pandas as pd
 
-from config import DEFAULT_TOL_MM
-from tools.db import ensure_schema, insert_items, rebuild_fts, set_meta
+from tools.db import ensure_schema, insert_items, rebuild_fts, save_import_summary
 
 NAME_KEYWORDS = (
     "шкаф",
@@ -62,22 +60,11 @@ CANONICAL_FIELDS = (
 LOGGER = logging.getLogger(__name__)
 
 
-def compute_source_version(path: Path) -> str:
-    sha256 = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            sha256.update(chunk)
-    digest = sha256.hexdigest()[:10]
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    return f"{path.stem}_{timestamp}_{digest}"
-
-
 def import_workbook(path: Path, conn) -> dict[str, Any]:
     ensure_schema(conn)
-    source_version = compute_source_version(path)
-
-    conn.execute("DELETE FROM items WHERE source_version = ?", (source_version,))
-    conn.execute("DELETE FROM sheet_schemas WHERE source_version = ?", (source_version,))
+    conn.execute("DELETE FROM items")
+    conn.execute("DELETE FROM sheet_schemas")
+    conn.execute("DELETE FROM import_summary")
     conn.commit()
 
     excel = pd.ExcelFile(path)
@@ -95,9 +82,8 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
         "rows_total": 0,
         "rows_inserted": 0,
         "rows_skipped": 0,
-        "rows_unit_price_from_price_unit": 0,
-        "rows_unit_price_from_material_install": 0,
-        "rows_unit_price_from_total_div_qty": 0,
+        "rows_unit_price_from_unit": 0,
+        "rows_unit_price_from_total_qty": 0,
         "sheets_problematic": 0,
     }
 
@@ -134,11 +120,10 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
         )
         conn.execute(
             """
-            INSERT INTO sheet_schemas (source_version, sheet_name, detected, confidence, map_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO sheet_schemas (sheet_name, detected, confidence, map_json)
+            VALUES (?, ?, ?, ?)
             """,
             (
-                source_version,
                 sheet_name,
                 detected,
                 confidence,
@@ -193,13 +178,7 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
         for row_idx, row in df.iterrows():
             rows_total += 1
             source_row = header_row + 2 + row_idx
-            parsed, price_source = parse_row(
-                row,
-                mapping,
-                source_version,
-                sheet_name,
-                source_row,
-            )
+            parsed, price_source = parse_row(row, mapping, sheet_name, source_row)
             if parsed is None:
                 skipped_rows += 1
                 rows_skipped += 1
@@ -207,11 +186,9 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
             rows_to_insert.append(parsed)
             rows_inserted += 1
             if price_source == "price_unit":
-                summary["rows_unit_price_from_price_unit"] += 1
-            elif price_source == "material_install":
-                summary["rows_unit_price_from_material_install"] += 1
+                summary["rows_unit_price_from_unit"] += 1
             elif price_source == "total_div_qty":
-                summary["rows_unit_price_from_total_div_qty"] += 1
+                summary["rows_unit_price_from_total_qty"] += 1
         if rows_to_insert:
             insert_items(conn, rows_to_insert)
             total_inserted += len(rows_to_insert)
@@ -231,49 +208,23 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
         )
 
     rebuild_fts(conn)
-    stats = _compute_import_stats(conn, source_version)
-    set_meta(conn, "active_version", source_version)
-    set_meta(conn, f"version_path:{source_version}", str(path))
-    set_meta(conn, "last_import_at", datetime.utcnow().isoformat())
-    set_meta(conn, "default_tol_mm", str(DEFAULT_TOL_MM))
-    set_meta(conn, "stats:total_items", str(stats["total_items"]))
-    set_meta(conn, "stats:valid_items", str(stats["valid_items"]))
-    set_meta(conn, "stats:sheets_detected", str(detected_sheets))
-    set_meta(conn, "stats:skipped_rows", str(skipped_rows))
-    set_meta(conn, "stats:rows_with_price_unit", str(stats["rows_with_price_unit"]))
-    set_meta(conn, "stats:rows_with_total_and_qty", str(stats["rows_with_total_and_qty"]))
-    set_meta(conn, "stats:sheets_total", str(summary["sheets_total"]))
-    set_meta(conn, "stats:sheets_ok", str(summary["sheets_ok"]))
-    set_meta(conn, "stats:sheets_missing_price_unit", str(summary["sheets_missing_price_unit"]))
-    set_meta(conn, "stats:sheets_missing_qty", str(summary["sheets_missing_qty"]))
-    set_meta(conn, "stats:rows_total", str(summary["rows_total"]))
-    set_meta(conn, "stats:rows_inserted", str(summary["rows_inserted"]))
-    set_meta(conn, "stats:rows_skipped", str(summary["rows_skipped"]))
-    set_meta(
+    save_import_summary(
         conn,
-        "stats:rows_unit_price_from_price_unit",
-        str(summary["rows_unit_price_from_price_unit"]),
+        created_at=datetime.utcnow().isoformat(),
+        sheets_detected=detected_sheets,
+        rows_scanned=summary["rows_total"],
+        rows_inserted=summary["rows_inserted"],
+        rows_skipped=summary["rows_skipped"],
+        rows_unit_price_from_unit=summary["rows_unit_price_from_unit"],
+        rows_unit_price_from_total_qty=summary["rows_unit_price_from_total_qty"],
     )
-    set_meta(
-        conn,
-        "stats:rows_unit_price_from_material_install",
-        str(summary["rows_unit_price_from_material_install"]),
-    )
-    set_meta(
-        conn,
-        "stats:rows_unit_price_from_total_div_qty",
-        str(summary["rows_unit_price_from_total_div_qty"]),
-    )
-    set_meta(conn, "stats:sheets_problematic", str(summary["sheets_problematic"]))
 
     return {
-        "source_version": source_version,
         "inserted": total_inserted,
         "detected_sheets": detected_sheets,
         "skipped_sheets": skipped_sheets,
         "total_sheets": len(sheet_names),
         "skipped_rows": skipped_rows,
-        "stats": stats,
         "sheet_reports": sheet_reports,
         "summary": summary,
     }
@@ -365,7 +316,7 @@ def debug_workbook_mapping(
             for row_idx, row in df.iterrows():
                 rows_total += 1
                 source_row = header_row + 2 + row_idx
-                parsed, _ = parse_row(row, mapping, "debug", sheet_name, source_row)
+                parsed, _ = parse_row(row, mapping, sheet_name, source_row)
                 if parsed is None:
                     rows_skipped += 1
                 else:
@@ -531,15 +482,14 @@ def _best_col(score_map: dict[Hashable, float]) -> Hashable | None:
 def parse_row(
     row: pd.Series,
     mapping: dict[str, Hashable | None],
-    source_version: str,
     sheet_name: str,
     source_row: int,
 ) -> tuple[tuple | None, str | None]:
-    name = _normalize_text(_get_value(row, mapping.get("name_col")))
-    description = _normalize_text(_get_value(row, mapping.get("desc_col")))
-
-    if not name:
+    raw_name = _get_value(row, mapping.get("name_col"))
+    name = _normalize_string(raw_name)
+    if not name or not isinstance(raw_name, str):
         return None, None
+    description = _normalize_string(_get_value(row, mapping.get("desc_col")))
 
     dims_raw = _get_value(row, mapping.get("dims_col"))
     w_mm, d_mm, h_mm = _parse_dimensions(dims_raw)
@@ -548,22 +498,15 @@ def parse_row(
 
     qty = _to_float(_get_value(row, mapping.get("qty_col")))
     price_unit_val = _get_value(row, mapping.get("price_unit_col"))
-    price_material_val = _get_value(row, mapping.get("price_material_col"))
-    price_install_val = _get_value(row, mapping.get("price_install_col"))
     price_total_val = _get_value(row, mapping.get("total_col"))
     price_total_ex_vat = _to_float(price_total_val)
     price_unit_ex_vat, unit_price_source = compute_unit_price_with_source(
         price_unit=price_unit_val,
-        price_material=price_material_val,
-        price_install=price_install_val,
         total=price_total_ex_vat,
         qty=qty,
     )
 
-    if _is_invalid_row(name, description, qty, price_unit_ex_vat, price_total_ex_vat):
-        return None, None
-
-    if not _has_signal(name, description, w_mm, d_mm, h_mm, price_unit_ex_vat, price_total_ex_vat):
+    if price_unit_ex_vat is None or price_unit_ex_vat <= 0:
         return None, None
 
     flags_text = _normalize_for_flags(f"{name or ''} {description or ''}")
@@ -577,7 +520,6 @@ def parse_row(
     raw_json = json.dumps(row.to_dict(), ensure_ascii=False)
 
     return (
-        source_version,
         sheet_name,
         source_row,
         name,
@@ -604,20 +546,22 @@ def _get_value(row: pd.Series, col: Hashable | None) -> Any:
     return row.get(col)
 
 
-def _normalize_text(value: Any) -> str | None:
-    if value is None:
+def _normalize_string(value: Any) -> str | None:
+    if value is None or pd.isna(value):
         return None
     text = str(value).strip()
     if not text:
         return None
     lowered = text.lower()
-    if lowered == "nan" or lowered == "-":
+    if lowered in {"nan", "-"}:
         return None
     return text
 
 
 def _to_float(value: Any) -> float | None:
     if value is None:
+        return None
+    if pd.isna(value):
         return None
     if isinstance(value, (int, float)):
         return float(value)
@@ -656,15 +600,11 @@ def _parse_dimensions(value: Any) -> tuple[int | None, int | None, int | None]:
 def compute_unit_price(
     *,
     price_unit: Any,
-    price_material: Any,
-    price_install: Any,
     total: float | None,
     qty: float | None,
 ) -> float | None:
     value, _ = compute_unit_price_with_source(
         price_unit=price_unit,
-        price_material=price_material,
-        price_install=price_install,
         total=total,
         qty=qty,
     )
@@ -674,18 +614,12 @@ def compute_unit_price(
 def compute_unit_price_with_source(
     *,
     price_unit: Any,
-    price_material: Any,
-    price_install: Any,
     total: float | None,
     qty: float | None,
 ) -> tuple[float | None, str | None]:
     unit_value = _to_float(price_unit)
     if unit_value is not None and unit_value > 0:
         return unit_value, "price_unit"
-    material_value = _to_float(price_material)
-    install_value = _to_float(price_install)
-    if material_value is not None or install_value is not None:
-        return (material_value or 0.0) + (install_value or 0.0), "material_install"
     if total is not None and qty is not None and qty > 0:
         return total / qty, "total_div_qty"
     return None, None
@@ -706,26 +640,6 @@ def _extract_prefixed_dim(text: str, stems: tuple[str, ...]) -> int | None:
     return None
 
 
-def _looks_like_header(name: str) -> bool:
-    lowered = _normalize_for_flags(name)
-    header_tokens = (
-        "наименование",
-        "материал",
-        "материалы",
-        "описание",
-        "ед изм",
-        "единиц",
-        "кол во",
-        "количество",
-        "цена",
-        "итого",
-        "стоимость",
-        "позиция",
-        "номер",
-    )
-    return any(token in lowered for token in header_tokens)
-
-
 def _format_mapping_for_log(mapping: dict[str, Hashable | None]) -> dict[str, str | None]:
     formatted: dict[str, str | None] = {}
     for field in CANONICAL_FIELDS:
@@ -737,10 +651,8 @@ def _format_mapping_for_log(mapping: dict[str, Hashable | None]) -> dict[str, st
 
 def _missing_price_source(mapping: dict[str, Hashable | None]) -> bool:
     has_unit = mapping.get("price_unit_col") is not None
-    has_material = mapping.get("price_material_col") is not None
-    has_install = mapping.get("price_install_col") is not None
     has_total_qty = mapping.get("total_col") is not None and mapping.get("qty_col") is not None
-    return not (has_unit or has_material or has_install or has_total_qty)
+    return not (has_unit or has_total_qty)
 
 
 def _missing_critical_fields(mapping: dict[str, Hashable | None]) -> list[str]:
@@ -778,76 +690,3 @@ def _build_sheet_report(
         "unused_headers": _unused_headers(columns, mapping),
         "missing_critical_fields": _missing_critical_fields(mapping),
     }
-
-
-def _compute_import_stats(conn, source_version: str) -> dict[str, int]:
-    total_items = conn.execute(
-        "SELECT COUNT(*) FROM items WHERE source_version = ?",
-        (source_version,),
-    ).fetchone()[0]
-    valid_items = conn.execute(
-        "SELECT COUNT(*) FROM items WHERE source_version = ? AND is_valid = 1",
-        (source_version,),
-    ).fetchone()[0]
-    rows_with_price_unit = conn.execute(
-        """
-        SELECT COUNT(*) FROM items
-        WHERE source_version = ?
-          AND price_unit_ex_vat IS NOT NULL
-          AND price_unit_ex_vat > 0
-        """,
-        (source_version,),
-    ).fetchone()[0]
-    rows_with_total_and_qty = conn.execute(
-        """
-        SELECT COUNT(*) FROM items
-        WHERE source_version = ?
-          AND price_total_ex_vat IS NOT NULL
-          AND qty IS NOT NULL
-          AND qty > 0
-        """,
-        (source_version,),
-    ).fetchone()[0]
-    return {
-        "total_items": int(total_items),
-        "valid_items": int(valid_items),
-        "rows_with_price_unit": int(rows_with_price_unit),
-        "rows_with_total_and_qty": int(rows_with_total_and_qty),
-    }
-
-
-def _is_invalid_row(
-    name: str,
-    description: str | None,
-    qty: float | None,
-    price_unit: float | None,
-    price_total: float | None,
-) -> bool:
-    if name.strip().lower() in {"nan", "-"}:
-        return True
-    if _looks_like_header(name) and not (qty or price_unit or price_total):
-        return True
-    if not description and not (qty or price_unit or price_total):
-        return True
-    return False
-
-
-def _has_signal(
-    name: str | None,
-    description: str | None,
-    w_mm: int | None,
-    d_mm: int | None,
-    h_mm: int | None,
-    price_unit: float | None,
-    price_total: float | None,
-) -> bool:
-    if name or description:
-        keywords = (name or "") + (description or "")
-        lowered = keywords.lower()
-        if any(token in lowered for token in NAME_KEYWORDS):
-            return True
-    if any(val is not None for val in (w_mm, d_mm, h_mm)):
-        return True
-    if price_unit or price_total:
-        return True
-    return False
