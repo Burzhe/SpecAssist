@@ -7,6 +7,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SpecAssist entrypoint")
     parser.add_argument("--profile", action="store_true", help="Profile Excel and exit")
     parser.add_argument("--reindex", type=str, help="Recreate DB and import Excel from path")
+    parser.add_argument("--debug-mapping", type=str, help="Debug Excel sheet mappings")
+    parser.add_argument("--limit-sheets", type=int, help="Limit sheets in debug mapping mode")
+    parser.add_argument(
+        "--max-rows-scan",
+        type=int,
+        default=50,
+        help="Max rows to scan in debug mapping mode (default 50)",
+    )
     parser.add_argument("--search", type=str, help="Search query")
     parser.add_argument("--sample", type=int, help="Print first N records from sqlite")
     parser.add_argument("--facets", action="store_true", help="Print flag/material counts")
@@ -22,6 +30,16 @@ def main() -> None:
         from tools.import_excel import main as import_main
 
         import_main(args.reindex)
+        return
+
+    if args.debug_mapping:
+        from tools.import_excel import debug_mapping
+
+        debug_mapping(
+            args.debug_mapping,
+            limit_sheets=args.limit_sheets,
+            max_rows_scan=args.max_rows_scan,
+        )
         return
 
     if args.search:

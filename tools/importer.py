@@ -47,6 +47,18 @@ MATERIAL_KEYWORDS = (
 
 DIM_PATTERN = re.compile(r"\d{2,5}\s*[x×*х]\s*\d{2,5}\s*[x×*х]\s*\d{2,5}", re.IGNORECASE)
 HEADER_SCAN_ROWS = 50
+CANONICAL_FIELDS = (
+    "name",
+    "dims",
+    "desc",
+    "qty",
+    "unit",
+    "price_material",
+    "price_install",
+    "price_unit",
+    "total",
+    "comment",
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -74,13 +86,32 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
     detected_sheets = 0
     skipped_sheets = 0
     skipped_rows = 0
+    sheet_reports: list[dict[str, Any]] = []
+    summary = {
+        "sheets_total": 0,
+        "sheets_ok": 0,
+        "sheets_missing_price_unit": 0,
+        "sheets_missing_qty": 0,
+        "rows_total": 0,
+        "rows_inserted": 0,
+        "rows_skipped": 0,
+        "rows_unit_price_from_price_unit": 0,
+        "rows_unit_price_from_material_install": 0,
+        "rows_unit_price_from_total_div_qty": 0,
+        "sheets_problematic": 0,
+    }
 
     for sheet_name in sheet_names:
+        summary["sheets_total"] += 1
         header_row = detect_header_row(path, sheet_name)
         if header_row is None:
             mapping, confidence, stats = _empty_mapping()
             stats["header_row"] = None
             detected = 0
+            columns: list[Hashable] = []
+            rows_total = 0
+            rows_inserted = 0
+            rows_skipped = 0
         else:
             sample_df = pd.read_excel(
                 path,
@@ -92,6 +123,10 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
             mapping, confidence, stats = detect_sheet_mapping(sample_df)
             stats["header_row"] = header_row + 1
             detected = int(confidence >= 0.35 and mapping.get("name_col") is not None)
+            columns = list(sample_df.columns)
+            rows_total = 0
+            rows_inserted = 0
+            rows_skipped = 0
         LOGGER.info(
             "Detected sheet mapping: %s -> %s",
             sheet_name,
@@ -112,26 +147,88 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
         )
         conn.commit()
 
+        missing_critical = _missing_critical_fields(mapping)
+        if mapping.get("price_unit_col") is None:
+            summary["sheets_missing_price_unit"] += 1
+        if mapping.get("qty_col") is None:
+            summary["sheets_missing_qty"] += 1
+        if missing_critical:
+            summary["sheets_problematic"] += 1
+        else:
+            summary["sheets_ok"] += 1
+
         if not detected:
             skipped_sheets += 1
+            sheet_reports.append(
+                _build_sheet_report(
+                    sheet_name=sheet_name,
+                    header_row=stats["header_row"],
+                    rows_total=rows_total,
+                    rows_inserted=rows_inserted,
+                    rows_skipped=rows_skipped,
+                    mapping=mapping,
+                    columns=columns,
+                )
+            )
             continue
 
         detected_sheets += 1
         if header_row is None:
             skipped_sheets += 1
+            sheet_reports.append(
+                _build_sheet_report(
+                    sheet_name=sheet_name,
+                    header_row=stats["header_row"],
+                    rows_total=rows_total,
+                    rows_inserted=rows_inserted,
+                    rows_skipped=rows_skipped,
+                    mapping=mapping,
+                    columns=columns,
+                )
+            )
             continue
         df = pd.read_excel(path, sheet_name=sheet_name, header=header_row, engine="openpyxl")
+        columns = list(df.columns)
         rows_to_insert: list[tuple] = []
         for row_idx, row in df.iterrows():
+            rows_total += 1
             source_row = header_row + 2 + row_idx
-            parsed = parse_row(row, mapping, source_version, sheet_name, source_row)
+            parsed, price_source = parse_row(
+                row,
+                mapping,
+                source_version,
+                sheet_name,
+                source_row,
+            )
             if parsed is None:
                 skipped_rows += 1
+                rows_skipped += 1
                 continue
             rows_to_insert.append(parsed)
+            rows_inserted += 1
+            if price_source == "price_unit":
+                summary["rows_unit_price_from_price_unit"] += 1
+            elif price_source == "material_install":
+                summary["rows_unit_price_from_material_install"] += 1
+            elif price_source == "total_div_qty":
+                summary["rows_unit_price_from_total_div_qty"] += 1
         if rows_to_insert:
             insert_items(conn, rows_to_insert)
             total_inserted += len(rows_to_insert)
+        summary["rows_total"] += rows_total
+        summary["rows_inserted"] += rows_inserted
+        summary["rows_skipped"] += rows_skipped
+        sheet_reports.append(
+            _build_sheet_report(
+                sheet_name=sheet_name,
+                header_row=stats["header_row"],
+                rows_total=rows_total,
+                rows_inserted=rows_inserted,
+                rows_skipped=rows_skipped,
+                mapping=mapping,
+                columns=columns,
+            )
+        )
 
     rebuild_fts(conn)
     stats = _compute_import_stats(conn, source_version)
@@ -145,6 +242,29 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
     set_meta(conn, "stats:skipped_rows", str(skipped_rows))
     set_meta(conn, "stats:rows_with_price_unit", str(stats["rows_with_price_unit"]))
     set_meta(conn, "stats:rows_with_total_and_qty", str(stats["rows_with_total_and_qty"]))
+    set_meta(conn, "stats:sheets_total", str(summary["sheets_total"]))
+    set_meta(conn, "stats:sheets_ok", str(summary["sheets_ok"]))
+    set_meta(conn, "stats:sheets_missing_price_unit", str(summary["sheets_missing_price_unit"]))
+    set_meta(conn, "stats:sheets_missing_qty", str(summary["sheets_missing_qty"]))
+    set_meta(conn, "stats:rows_total", str(summary["rows_total"]))
+    set_meta(conn, "stats:rows_inserted", str(summary["rows_inserted"]))
+    set_meta(conn, "stats:rows_skipped", str(summary["rows_skipped"]))
+    set_meta(
+        conn,
+        "stats:rows_unit_price_from_price_unit",
+        str(summary["rows_unit_price_from_price_unit"]),
+    )
+    set_meta(
+        conn,
+        "stats:rows_unit_price_from_material_install",
+        str(summary["rows_unit_price_from_material_install"]),
+    )
+    set_meta(
+        conn,
+        "stats:rows_unit_price_from_total_div_qty",
+        str(summary["rows_unit_price_from_total_div_qty"]),
+    )
+    set_meta(conn, "stats:sheets_problematic", str(summary["sheets_problematic"]))
 
     return {
         "source_version": source_version,
@@ -154,15 +274,17 @@ def import_workbook(path: Path, conn) -> dict[str, Any]:
         "total_sheets": len(sheet_names),
         "skipped_rows": skipped_rows,
         "stats": stats,
+        "sheet_reports": sheet_reports,
+        "summary": summary,
     }
 
 
-def detect_header_row(path: Path, sheet_name: str) -> int | None:
+def detect_header_row(path: Path, sheet_name: str, *, max_rows_scan: int = HEADER_SCAN_ROWS) -> int | None:
     preview = pd.read_excel(
         path,
         sheet_name=sheet_name,
         header=None,
-        nrows=HEADER_SCAN_ROWS,
+        nrows=max_rows_scan,
         engine="openpyxl",
     )
     for row_idx, row in preview.iterrows():
@@ -204,6 +326,62 @@ def detect_sheet_mapping(df: pd.DataFrame) -> tuple[dict[str, Hashable | None], 
 
     confidence = 1.0 if mapping.get("name_col") is not None else 0.0
     return mapping, confidence, stats
+
+
+def debug_workbook_mapping(
+    path: Path,
+    *,
+    limit_sheets: int | None = None,
+    max_rows_scan: int = HEADER_SCAN_ROWS,
+) -> dict[str, Any]:
+    excel = pd.ExcelFile(path)
+    sheet_names = excel.sheet_names
+    if limit_sheets is not None:
+        sheet_names = sheet_names[:limit_sheets]
+    sheet_reports: list[dict[str, Any]] = []
+    for sheet_name in sheet_names:
+        header_row = detect_header_row(path, sheet_name, max_rows_scan=max_rows_scan)
+        if header_row is None:
+            mapping, _, stats = _empty_mapping()
+            stats["header_row"] = None
+            columns: list[Hashable] = []
+            rows_total = 0
+            rows_inserted = 0
+            rows_skipped = 0
+        else:
+            df = pd.read_excel(
+                path,
+                sheet_name=sheet_name,
+                header=header_row,
+                nrows=max_rows_scan,
+                engine="openpyxl",
+            )
+            mapping, _, stats = detect_sheet_mapping(df)
+            stats["header_row"] = header_row + 1
+            columns = list(df.columns)
+            rows_total = 0
+            rows_inserted = 0
+            rows_skipped = 0
+            for row_idx, row in df.iterrows():
+                rows_total += 1
+                source_row = header_row + 2 + row_idx
+                parsed, _ = parse_row(row, mapping, "debug", sheet_name, source_row)
+                if parsed is None:
+                    rows_skipped += 1
+                else:
+                    rows_inserted += 1
+        sheet_reports.append(
+            _build_sheet_report(
+                sheet_name=sheet_name,
+                header_row=stats["header_row"],
+                rows_total=rows_total,
+                rows_inserted=rows_inserted,
+                rows_skipped=rows_skipped,
+                mapping=mapping,
+                columns=columns,
+            )
+        )
+    return {"sheet_reports": sheet_reports}
 
 
 def analyze_column(series: pd.Series) -> dict[str, float]:
@@ -356,12 +534,12 @@ def parse_row(
     source_version: str,
     sheet_name: str,
     source_row: int,
-) -> tuple | None:
+) -> tuple[tuple | None, str | None]:
     name = _normalize_text(_get_value(row, mapping.get("name_col")))
     description = _normalize_text(_get_value(row, mapping.get("desc_col")))
 
     if not name:
-        return None
+        return None, None
 
     dims_raw = _get_value(row, mapping.get("dims_col"))
     w_mm, d_mm, h_mm = _parse_dimensions(dims_raw)
@@ -374,7 +552,7 @@ def parse_row(
     price_install_val = _get_value(row, mapping.get("price_install_col"))
     price_total_val = _get_value(row, mapping.get("total_col"))
     price_total_ex_vat = _to_float(price_total_val)
-    price_unit_ex_vat = compute_unit_price(
+    price_unit_ex_vat, unit_price_source = compute_unit_price_with_source(
         price_unit=price_unit_val,
         price_material=price_material_val,
         price_install=price_install_val,
@@ -383,10 +561,10 @@ def parse_row(
     )
 
     if _is_invalid_row(name, description, qty, price_unit_ex_vat, price_total_ex_vat):
-        return None
+        return None, None
 
     if not _has_signal(name, description, w_mm, d_mm, h_mm, price_unit_ex_vat, price_total_ex_vat):
-        return None
+        return None, None
 
     flags_text = _normalize_for_flags(f"{name or ''} {description or ''}")
     has_led = int(any(token in flags_text for token in ("подсвет", "подсветка", "led", "лента")))
@@ -417,7 +595,7 @@ def parse_row(
         has_glass,
         has_metal,
         raw_json,
-    )
+    ), unit_price_source
 
 
 def _get_value(row: pd.Series, col: Hashable | None) -> Any:
@@ -483,16 +661,34 @@ def compute_unit_price(
     total: float | None,
     qty: float | None,
 ) -> float | None:
+    value, _ = compute_unit_price_with_source(
+        price_unit=price_unit,
+        price_material=price_material,
+        price_install=price_install,
+        total=total,
+        qty=qty,
+    )
+    return value
+
+
+def compute_unit_price_with_source(
+    *,
+    price_unit: Any,
+    price_material: Any,
+    price_install: Any,
+    total: float | None,
+    qty: float | None,
+) -> tuple[float | None, str | None]:
     unit_value = _to_float(price_unit)
     if unit_value is not None and unit_value > 0:
-        return unit_value
+        return unit_value, "price_unit"
     material_value = _to_float(price_material)
     install_value = _to_float(price_install)
     if material_value is not None or install_value is not None:
-        return (material_value or 0.0) + (install_value or 0.0)
+        return (material_value or 0.0) + (install_value or 0.0), "material_install"
     if total is not None and qty is not None and qty > 0:
-        return total / qty
-    return None
+        return total / qty, "total_div_qty"
+    return None, None
 
 
 def _normalize_for_flags(text: str) -> str:
@@ -532,10 +728,56 @@ def _looks_like_header(name: str) -> bool:
 
 def _format_mapping_for_log(mapping: dict[str, Hashable | None]) -> dict[str, str | None]:
     formatted: dict[str, str | None] = {}
-    for key, value in mapping.items():
-        canonical = key.replace("_col", "")
-        formatted[canonical] = None if value is None else str(value)
+    for field in CANONICAL_FIELDS:
+        key = f"{field}_col"
+        value = mapping.get(key)
+        formatted[field] = None if value is None else str(value)
     return formatted
+
+
+def _missing_price_source(mapping: dict[str, Hashable | None]) -> bool:
+    has_unit = mapping.get("price_unit_col") is not None
+    has_material = mapping.get("price_material_col") is not None
+    has_install = mapping.get("price_install_col") is not None
+    has_total_qty = mapping.get("total_col") is not None and mapping.get("qty_col") is not None
+    return not (has_unit or has_material or has_install or has_total_qty)
+
+
+def _missing_critical_fields(mapping: dict[str, Hashable | None]) -> list[str]:
+    missing: list[str] = []
+    if mapping.get("name_col") is None:
+        missing.append("name")
+    if _missing_price_source(mapping):
+        missing.append("price_source")
+    return missing
+
+
+def _unused_headers(columns: list[Hashable], mapping: dict[str, Hashable | None]) -> list[str]:
+    used = {str(value) for value in mapping.values() if value is not None}
+    unused = [str(col) for col in columns if str(col) not in used]
+    return unused
+
+
+def _build_sheet_report(
+    *,
+    sheet_name: str,
+    header_row: int | None,
+    rows_total: int,
+    rows_inserted: int,
+    rows_skipped: int,
+    mapping: dict[str, Hashable | None],
+    columns: list[Hashable],
+) -> dict[str, Any]:
+    return {
+        "sheet_name": sheet_name,
+        "header_row": header_row,
+        "rows_total": rows_total,
+        "rows_inserted": rows_inserted,
+        "rows_skipped": rows_skipped,
+        "mapping": _format_mapping_for_log(mapping),
+        "unused_headers": _unused_headers(columns, mapping),
+        "missing_critical_fields": _missing_critical_fields(mapping),
+    }
 
 
 def _compute_import_stats(conn, source_version: str) -> dict[str, int]:

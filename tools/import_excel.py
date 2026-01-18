@@ -4,7 +4,33 @@ from pathlib import Path
 
 from config import EXCEL_PATH
 from tools.db import get_connection
-from tools.importer import import_workbook
+from tools.importer import debug_workbook_mapping, import_workbook
+
+
+def _print_mapping_report(sheet_reports: list[dict]) -> None:
+    for report in sheet_reports:
+        header_row = report.get("header_row")
+        header_display = header_row if header_row is not None else "-"
+        print(f"Sheet: {report.get('sheet_name')}")
+        print(f"  header_row: {header_display}")
+        print(
+            "  rows: total={total}, inserted={inserted}, skipped={skipped}".format(
+                total=report.get("rows_total", 0),
+                inserted=report.get("rows_inserted", 0),
+                skipped=report.get("rows_skipped", 0),
+            )
+        )
+        print("  mapping:")
+        mapping = report.get("mapping") or {}
+        for key, value in mapping.items():
+            print(f"    - {key}: {value or '-'}")
+        unused_headers = report.get("unused_headers") or []
+        missing_critical = report.get("missing_critical_fields") or []
+        unused_display = ", ".join(unused_headers) if unused_headers else "-"
+        missing_display = ", ".join(missing_critical) if missing_critical else "-"
+        print(f"  unused_headers: {unused_display}")
+        print(f"  missing_critical_fields: {missing_display}")
+        print("")
 
 
 def import_excel(path: str | None = None) -> dict:
@@ -46,6 +72,29 @@ def sample_items(limit: int) -> None:
 
 def main(path: str | None = None) -> None:
     result = import_excel(path)
+    _print_mapping_report(result.get("sheet_reports", []))
+    summary = result.get("summary", {})
+    if summary:
+        print("Reindex summary:")
+        print(f"  sheets_total: {summary.get('sheets_total', 0)}")
+        print(f"  sheets_ok: {summary.get('sheets_ok', 0)}")
+        print(f"  sheets_missing_price_unit: {summary.get('sheets_missing_price_unit', 0)}")
+        print(f"  sheets_missing_qty: {summary.get('sheets_missing_qty', 0)}")
+        print(f"  rows_total: {summary.get('rows_total', 0)}")
+        print(f"  rows_inserted: {summary.get('rows_inserted', 0)}")
+        print(f"  rows_skipped: {summary.get('rows_skipped', 0)}")
+        print(
+            "  rows_unit_price_from_price_unit: "
+            f"{summary.get('rows_unit_price_from_price_unit', 0)}"
+        )
+        print(
+            "  rows_unit_price_from_material_install: "
+            f"{summary.get('rows_unit_price_from_material_install', 0)}"
+        )
+        print(
+            "  rows_unit_price_from_total_div_qty: "
+            f"{summary.get('rows_unit_price_from_total_div_qty', 0)}"
+        )
     print(
         "Imported {inserted} rows into DB, detected sheets {detected_sheets}, skipped {skipped_sheets}.".format(
             inserted=result["inserted"],
@@ -53,6 +102,21 @@ def main(path: str | None = None) -> None:
             skipped_sheets=result["skipped_sheets"],
         )
     )
+    from tools.telegram_bot import send_admin_import_summary
+
+    send_admin_import_summary(result)
+
+
+def debug_mapping(path: str, *, limit_sheets: int | None = None, max_rows_scan: int = 50) -> None:
+    excel_path = Path(path)
+    if not excel_path.exists():
+        raise FileNotFoundError("Excel path does not exist.")
+    result = debug_workbook_mapping(
+        excel_path,
+        limit_sheets=limit_sheets,
+        max_rows_scan=max_rows_scan,
+    )
+    _print_mapping_report(result.get("sheet_reports", []))
 
 
 if __name__ == "__main__":
