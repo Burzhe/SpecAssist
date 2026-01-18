@@ -73,6 +73,30 @@ def is_authorized(user_id: int | None) -> bool:
     return allowed
 
 
+async def _send_startup_summary(app: Application) -> None:
+    if not ADMIN_IDS:
+        return
+    conn = get_connection()
+    total_items = int(get_meta(conn, "stats:total_items") or 0)
+    valid_items = int(get_meta(conn, "stats:valid_items") or 0)
+    sheets_detected = int(get_meta(conn, "stats:sheets_detected") or 0)
+    skipped_rows = int(get_meta(conn, "stats:skipped_rows") or 0)
+    rows_with_price_unit = int(get_meta(conn, "stats:rows_with_price_unit") or 0)
+    conn.close()
+    message = (
+        "База актуализирована: изделий {total} (валидных {valid}), листов {sheets}, "
+        "пропущено {skipped} строк. Цена за ед. найдена у {unit_rows} позиций."
+    ).format(
+        total=total_items,
+        valid=valid_items,
+        sheets=sheets_detected,
+        skipped=skipped_rows,
+        unit_rows=rows_with_price_unit,
+    )
+    for admin_id in ADMIN_IDS:
+        await app.bot.send_message(chat_id=admin_id, text=message)
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -985,7 +1009,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set")
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_send_startup_summary).build()
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("s", search_handler))
