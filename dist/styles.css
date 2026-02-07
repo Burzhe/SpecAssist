@@ -641,6 +641,74 @@ progress {
   display: none;
 }
 
+.mapping-modal .mapping-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin: 12px 0;
+}
+
+.mapping-modal .mapping-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.mapping-modal .mapping-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.mapping-modal .mapping-grid label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.mapping-modal .mapping-grid select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+}
+
+.mapping-modal .mapping-preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 12px;
+}
+
+.mapping-modal .mapping-preview-table th,
+.mapping-modal .mapping-preview-table td {
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.mapping-modal .mapping-preview-table thead th {
+  background: var(--sheet-list-bg);
+  font-weight: 600;
+}
+
+.mapping-modal .mapping-highlight {
+  background: rgba(47, 94, 246, 0.12);
+}
+
+.mapping-modal .mapping-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
 .compare-table {
   display: grid;
   gap: 12px;

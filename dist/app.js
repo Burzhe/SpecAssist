@@ -25,6 +25,18 @@
     has_metal: "Металл",
   };
 
+  const MAPPING_FIELDS = [
+    { key: "name_col", label: "Наименование" },
+    { key: "dims_col", label: "Размеры (Ш×Г×В)" },
+    { key: "desc_col", label: "Описание / Материал" },
+    { key: "qty_col", label: "Количество" },
+    { key: "price_unit_col", label: "Цена за ед." },
+    { key: "total_col", label: "Итого" },
+  ];
+
+  const MAPPING_STORAGE_KEY = "specassist_custom_mappings";
+  const TEMPLATE_STORAGE_KEY = "specassist_mapping_templates";
+
   const state = {
     items: [],
     index: null,
@@ -38,6 +50,11 @@
     searchTimer: null,
     filterTimer: null,
     previewMeta: {},
+    workbook: null,
+    sheetNames: [],
+    customMappings: { sheets: {}, global: null },
+    mappingTemplates: [],
+    activeMappingSheet: null,
     scrollTimer: null,
     progress: {
       sheetsTotal: 0,
@@ -58,6 +75,7 @@
     sheetList: document.getElementById("sheet-list"),
     selectAllBtn: document.getElementById("select-all-btn"),
     selectNoneBtn: document.getElementById("select-none-btn"),
+    mappingBtn: document.getElementById("mapping-btn"),
     importBtn: document.getElementById("import-btn"),
     progressContainer: document.getElementById("progress-container"),
     overallProgress: document.getElementById("overall-progress"),
@@ -106,6 +124,15 @@
     cartAvgPrice: document.getElementById("cart-avg-price"),
     cartTotalVolume: document.getElementById("cart-total-volume"),
     cartExportBtn: document.getElementById("cart-export-btn"),
+    columnMappingModal: document.getElementById("column-mapping-modal"),
+    closeColumnMapping: document.getElementById("close-column-mapping"),
+    mappingSheetName: document.getElementById("mapping-sheet-name"),
+    mappingPreview: document.getElementById("mapping-preview"),
+    mappingAutoBtn: document.getElementById("mapping-auto-btn"),
+    mappingSaveBtn: document.getElementById("mapping-save-btn"),
+    mappingApplyAll: document.getElementById("mapping-apply-all"),
+    mappingTemplateSelect: document.getElementById("mapping-template-select"),
+    mappingTemplateSave: document.getElementById("mapping-template-save"),
   };
 
   const dimInputs = {
@@ -177,6 +204,41 @@
       req.onsuccess = () => resolve(req.result ? req.result.value : null);
       req.onerror = () => reject(req.error);
     });
+  }
+
+  function loadCustomMappings() {
+    try {
+      const raw = localStorage.getItem(MAPPING_STORAGE_KEY);
+      if (!raw) return { sheets: {}, global: null };
+      const parsed = JSON.parse(raw);
+      return {
+        sheets: parsed.sheets || {},
+        global: parsed.global || null,
+      };
+    } catch (error) {
+      console.warn("[mapping] failed to load custom mappings", error);
+      return { sheets: {}, global: null };
+    }
+  }
+
+  function saveCustomMappings() {
+    localStorage.setItem(MAPPING_STORAGE_KEY, JSON.stringify(state.customMappings));
+  }
+
+  function loadMappingTemplates() {
+    try {
+      const raw = localStorage.getItem(TEMPLATE_STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      console.warn("[mapping] failed to load templates", error);
+      return [];
+    }
+  }
+
+  function saveMappingTemplates() {
+    localStorage.setItem(TEMPLATE_STORAGE_KEY, JSON.stringify(state.mappingTemplates));
   }
 
   async function addItems(items) {
@@ -392,12 +454,22 @@
   }
 
   function updateProgressUI(payload) {
-    const { sheetIndex, sheetName, rowsTotal, rowsInserted, rowsSkipped, sheetsTotal } = payload;
+    const {
+      sheetIndex,
+      sheetName,
+      rowsTotal,
+      rowsInserted,
+      rowsSkipped,
+      sheetsTotal,
+      summary,
+    } = payload;
     state.progress.sheetsTotal = sheetsTotal;
     state.progress.sheetsDone = sheetIndex + 1;
-    state.progress.rowsTotal += rowsTotal;
-    state.progress.rowsInserted += rowsInserted;
-    state.progress.rowsSkipped += rowsSkipped;
+    if (summary) {
+      state.progress.rowsTotal = summary.rows_total;
+      state.progress.rowsInserted = summary.rows_inserted;
+      state.progress.rowsSkipped = summary.rows_skipped;
+    }
 
     const progressPercent = Math.round((state.progress.sheetsDone / sheetsTotal) * 100);
     elements.overallProgress.value = progressPercent;
@@ -406,14 +478,23 @@
     else if (progressPercent < 80) elements.progressMessage.textContent = "📊 Индексируем данные...";
     else elements.progressMessage.textContent = "✨ Готово!";
 
-    const row = document.createElement("div");
-    row.className = "progress-row";
-    row.innerHTML = `
-      <span>${sheetName}</span>
-      <progress value="${rowsInserted}" max="${Math.max(rowsTotal, rowsInserted, 1)}"></progress>
-      <span>${rowsInserted}/${rowsTotal}</span>
-    `;
-    elements.sheetProgress.appendChild(row);
+    let row = elements.sheetProgress.querySelector(`[data-sheet="${sheetName}"]`);
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "progress-row";
+      row.dataset.sheet = sheetName;
+      row.innerHTML = `
+        <span>${sheetName}</span>
+        <progress value="0" max="1"></progress>
+        <span>0/0</span>
+      `;
+      elements.sheetProgress.appendChild(row);
+    }
+    const progressEl = row.querySelector("progress");
+    const labelEl = row.querySelector("span:last-child");
+    progressEl.value = rowsInserted;
+    progressEl.max = Math.max(rowsTotal, rowsInserted, 1);
+    labelEl.textContent = `${rowsInserted}/${rowsTotal}`;
 
     elements.progressStats.innerHTML = `
       <div>Строк просканировано: <strong>${state.progress.rowsTotal}</strong></div>
@@ -421,6 +502,185 @@
       <div>Пропущено: <strong>${state.progress.rowsSkipped}</strong></div>
       <div>Листов: <strong>${state.progress.sheetsDone}/${state.progress.sheetsTotal}</strong></div>
     `;
+  }
+
+  function resetFiltersToDefault() {
+    elements.searchInput.value = "";
+    elements.categoryFilter.value = "";
+    elements.flagFilters.querySelectorAll("select[data-flag]").forEach((select) => (select.value = ""));
+    Object.values(priceInputs).forEach((input) => (input.value = ""));
+    Object.entries(dimInputs).forEach(([key, input]) => {
+      if (key.endsWith("Range")) return;
+      input.value = "";
+    });
+    dimInputs.wMinRange.value = 0;
+    dimInputs.wMaxRange.value = 6000;
+    dimInputs.dMinRange.value = 0;
+    dimInputs.dMaxRange.value = 6000;
+    dimInputs.hMinRange.value = 0;
+    dimInputs.hMaxRange.value = 6000;
+  }
+
+  function getColumnLetter(index) {
+    let result = "";
+    let current = index + 1;
+    while (current > 0) {
+      const remainder = (current - 1) % 26;
+      result = String.fromCharCode(65 + remainder) + result;
+      current = Math.floor((current - 1) / 26);
+    }
+    return result;
+  }
+
+  function buildColumnOptions(maxCols) {
+    const options = [{ value: "", label: "—" }];
+    for (let i = 0; i < maxCols; i += 1) {
+      const letter = getColumnLetter(i);
+      options.push({ value: String(i), label: `${letter} (${i + 1})` });
+    }
+    return options;
+  }
+
+  function suggestMapping(headers) {
+    const suggestions = {};
+    headers.forEach((header, idx) => {
+      const normalized = normalizeText(String(header || ""));
+      if (!normalized) return;
+      if (suggestions.name_col === undefined && /(наимен|товар|номенклат|издел|позици)/.test(normalized)) {
+        suggestions.name_col = idx;
+      }
+      if (suggestions.dims_col === undefined && /(размер|габарит|шхгхв|шир|выс|глуб)/.test(normalized)) {
+        suggestions.dims_col = idx;
+      }
+      if (suggestions.desc_col === undefined && /(описан|материал|коммент|примечан)/.test(normalized)) {
+        suggestions.desc_col = idx;
+      }
+      if (suggestions.qty_col === undefined && /(колич|кол-?во|кол\b|шт)/.test(normalized)) {
+        suggestions.qty_col = idx;
+      }
+      if (suggestions.price_unit_col === undefined && /(цена|стоим|руб).*(ед|шт)|цена.*ед|за\s*ед/.test(normalized)) {
+        suggestions.price_unit_col = idx;
+      }
+      if (suggestions.total_col === undefined && /(итого|сумма|всего)/.test(normalized)) {
+        suggestions.total_col = idx;
+      }
+    });
+    return suggestions;
+  }
+
+  function getModalMappingSelects() {
+    return Array.from(elements.columnMappingModal.querySelectorAll("select[data-mapping]"));
+  }
+
+  function applyMappingToModal(mapping) {
+    getModalMappingSelects().forEach((select) => {
+      const key = select.dataset.mapping;
+      const value = mapping && mapping[key] !== undefined && mapping[key] !== null ? String(mapping[key]) : "";
+      select.value = value;
+    });
+  }
+
+  function collectMappingFromModal() {
+    const mapping = {};
+    getModalMappingSelects().forEach((select) => {
+      const key = select.dataset.mapping;
+      mapping[key] = select.value !== "" ? Number(select.value) : null;
+    });
+    return mapping;
+  }
+
+  function renderMappingPreview(sheetName) {
+    if (!state.workbook) return;
+    const sheet = state.workbook.Sheets[sheetName];
+    if (!sheet) return;
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false, raw: true });
+    const previewRows = rows.slice(0, 12);
+    const meta = state.previewMeta[sheetName] || detectPreviewHeader(previewRows);
+    const headerRowIndex = meta.headerRowIndex ?? 0;
+    const headerRow = previewRows[headerRowIndex] || [];
+    const maxCols = Math.max(1, ...previewRows.map((row) => (row ? row.length : 0)));
+    const options = buildColumnOptions(maxCols);
+    const currentSelection = collectMappingFromModal();
+
+    getModalMappingSelects().forEach((select) => {
+      select.innerHTML = "";
+      options.forEach((option) => {
+        const opt = document.createElement("option");
+        opt.value = option.value;
+        opt.textContent = option.label;
+        select.appendChild(opt);
+      });
+    });
+    applyMappingToModal(currentSelection);
+
+    const selectedCols = new Set(
+      getModalMappingSelects()
+        .map((select) => (select.value !== "" ? Number(select.value) : null))
+        .filter((value) => value !== null),
+    );
+
+    const table = document.createElement("table");
+    table.className = "mapping-preview-table";
+    const thead = document.createElement("thead");
+    const letterRow = document.createElement("tr");
+    for (let i = 0; i < maxCols; i += 1) {
+      const th = document.createElement("th");
+      if (selectedCols.has(i)) th.classList.add("mapping-highlight");
+      th.textContent = getColumnLetter(i);
+      letterRow.appendChild(th);
+    }
+    thead.appendChild(letterRow);
+    const headerRowEl = document.createElement("tr");
+    for (let i = 0; i < maxCols; i += 1) {
+      const th = document.createElement("th");
+      if (selectedCols.has(i)) th.classList.add("mapping-highlight");
+      th.textContent = headerRow[i] ?? "";
+      headerRowEl.appendChild(th);
+    }
+    thead.appendChild(headerRowEl);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    previewRows.slice(headerRowIndex + 1, headerRowIndex + 11).forEach((row) => {
+      const tr = document.createElement("tr");
+      for (let i = 0; i < maxCols; i += 1) {
+        const td = document.createElement("td");
+        if (selectedCols.has(i)) td.classList.add("mapping-highlight");
+        td.textContent = row?.[i] ?? "";
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+
+    elements.mappingPreview.innerHTML = "";
+    elements.mappingPreview.appendChild(table);
+  }
+
+  function openColumnMappingModal(sheetName) {
+    state.activeMappingSheet = sheetName;
+    elements.mappingSheetName.textContent = sheetName;
+    const mapping = state.customMappings.sheets[sheetName] || state.customMappings.global || {};
+    elements.mappingApplyAll.checked = false;
+    elements.mappingTemplateSelect.value = "";
+    renderMappingPreview(sheetName);
+    applyMappingToModal(mapping);
+    renderMappingPreview(sheetName);
+    elements.columnMappingModal.classList.remove("hidden");
+  }
+
+  function closeColumnMappingModal() {
+    elements.columnMappingModal.classList.add("hidden");
+  }
+
+  function refreshTemplateSelect() {
+    elements.mappingTemplateSelect.innerHTML = `<option value="">Без шаблона</option>`;
+    state.mappingTemplates.forEach((template, idx) => {
+      const option = document.createElement("option");
+      option.value = String(idx);
+      option.textContent = template.name;
+      elements.mappingTemplateSelect.appendChild(option);
+    });
   }
 
   function getFilterValues() {
@@ -1001,6 +1261,7 @@
     sheetNames.forEach((name) => {
       const wrapper = document.createElement("label");
       wrapper.className = "sheet-item";
+      wrapper.dataset.sheet = name;
       const status = state.previewMeta[name]?.status;
       const statusIcon = status === "ok" ? "✅" : "❌";
       const statusTitle = status === "ok" ? "Структура распознана" : "Проверьте структуру листа";
@@ -1013,6 +1274,17 @@
     });
     elements.sheetOptions.classList.remove("hidden");
     elements.importBtn.disabled = false;
+  }
+
+  function updateSheetStatusBadge(sheetName, status = "ok") {
+    const item = elements.sheetList.querySelector(`[data-sheet="${sheetName}"]`);
+    if (!item) return;
+    const badge = item.querySelector(".sheet-status");
+    if (!badge) return;
+    badge.classList.remove("ok", "warn", "error");
+    badge.classList.add(status);
+    badge.textContent = status === "ok" ? "✅" : "❌";
+    badge.title = status === "ok" ? "Структура распознана" : "Проверьте структуру листа";
   }
 
   function classifyHeader(header) {
@@ -1124,6 +1396,7 @@
   async function importWorkbook(file, sheetNames) {
     resetProgress();
     elements.progressContainer.classList.remove("hidden");
+    console.info("[import] start", { file: file.name, sheets: sheetNames.length });
     const arrayBuffer = await file.arrayBuffer();
     const worker = createWorker();
     state.worker = worker;
@@ -1137,14 +1410,26 @@
         await addItems(payload.items);
       }
       if (type === "progress") {
+        console.info("[import] progress", payload);
         updateProgressUI(payload);
       }
       if (type === "done") {
+        console.info("[import] done", payload);
         await saveMeta("summary", payload.summary);
         await saveMeta("sheetReports", payload.sheetReports);
         await saveMeta("importedAt", new Date().toISOString());
+        const rowsInserted = payload.summary?.rows_inserted ?? state.items.length;
+        if (!rowsInserted) {
+          alert("Не удалось импортировать строки. Проверьте структуру листов или настройте колонки вручную.");
+          elements.overallProgressLabel.textContent = "0%";
+          elements.progressMessage.textContent = "⚠️ Данные не найдены.";
+          showScreen("upload");
+          worker.terminate();
+          return;
+        }
         buildIndex(state.items);
         updateCategoryFilter();
+        resetFiltersToDefault();
         showScreen("search");
         await handleSearch();
         triggerConfetti();
@@ -1168,6 +1453,7 @@
         fileName: file.name,
         sheetNames,
         selectedSheets,
+        customMappings: state.customMappings,
       },
     });
   }
@@ -1234,6 +1520,15 @@
       });
     });
 
+    elements.mappingBtn.addEventListener("click", () => {
+      const selected = getSelectedSheets();
+      if (!selected.length) {
+        alert("Сначала выберите лист для настройки.");
+        return;
+      }
+      openColumnMappingModal(selected[0]);
+    });
+
     elements.importBtn.addEventListener("click", async () => {
       const file = elements.fileInput.files[0];
       if (!file) return;
@@ -1271,20 +1566,7 @@
       handleSearch();
     });
     elements.resetFiltersBtn.addEventListener("click", () => {
-      elements.searchInput.value = "";
-      elements.categoryFilter.value = "";
-      elements.flagFilters.querySelectorAll("select[data-flag]").forEach((select) => (select.value = ""));
-      Object.values(priceInputs).forEach((input) => (input.value = ""));
-      Object.entries(dimInputs).forEach(([key, input]) => {
-        if (key.endsWith("Range")) return;
-        input.value = "";
-      });
-      dimInputs.wMinRange.value = 0;
-      dimInputs.wMaxRange.value = 6000;
-      dimInputs.dMinRange.value = 0;
-      dimInputs.dMaxRange.value = 6000;
-      dimInputs.hMinRange.value = 0;
-      dimInputs.hMaxRange.value = 6000;
+      resetFiltersToDefault();
       handleSearch();
     });
     elements.compareBtn.addEventListener("click", renderCompareModal);
@@ -1300,6 +1582,59 @@
     elements.cartBtn.addEventListener("click", () => elements.cartDrawer.classList.add("open"));
     elements.closeCart.addEventListener("click", () => elements.cartDrawer.classList.remove("open"));
     elements.cartExportBtn.addEventListener("click", () => exportItemsToExcel(state.cartItems, "specassist-cart.xlsx"));
+
+    elements.closeColumnMapping.addEventListener("click", closeColumnMappingModal);
+    elements.columnMappingModal.addEventListener("click", (event) => {
+      if (event.target === elements.columnMappingModal) closeColumnMappingModal();
+    });
+    elements.mappingAutoBtn.addEventListener("click", () => {
+      if (!state.activeMappingSheet) return;
+      const meta = state.previewMeta[state.activeMappingSheet];
+      const headers = meta?.headers || [];
+      const suggested = suggestMapping(headers);
+      console.info("[mapping] auto-detect", { sheet: state.activeMappingSheet, suggested });
+      applyMappingToModal(suggested);
+      renderMappingPreview(state.activeMappingSheet);
+    });
+    elements.mappingSaveBtn.addEventListener("click", () => {
+      if (!state.activeMappingSheet) return;
+      const mapping = collectMappingFromModal();
+      state.customMappings.sheets[state.activeMappingSheet] = mapping;
+      if (elements.mappingApplyAll.checked) {
+        state.customMappings.global = mapping;
+      }
+      if (!state.previewMeta[state.activeMappingSheet]) {
+        state.previewMeta[state.activeMappingSheet] = { status: "ok" };
+      } else {
+        state.previewMeta[state.activeMappingSheet].status = "ok";
+      }
+      saveCustomMappings();
+      updateSheetStatusBadge(state.activeMappingSheet, "ok");
+      console.info("[mapping] saved", { sheet: state.activeMappingSheet, mapping, global: elements.mappingApplyAll.checked });
+      closeColumnMappingModal();
+    });
+    elements.mappingTemplateSelect.addEventListener("change", () => {
+      const idx = Number(elements.mappingTemplateSelect.value);
+      if (!state.activeMappingSheet) return;
+      if (Number.isNaN(idx) || !state.mappingTemplates[idx]) return;
+      applyMappingToModal(state.mappingTemplates[idx].mapping);
+      renderMappingPreview(state.activeMappingSheet);
+    });
+    elements.mappingTemplateSave.addEventListener("click", () => {
+      const mapping = collectMappingFromModal();
+      const name = window.prompt("Название шаблона");
+      if (!name) return;
+      state.mappingTemplates.push({ name, mapping });
+      saveMappingTemplates();
+      refreshTemplateSelect();
+      elements.mappingTemplateSelect.value = String(state.mappingTemplates.length - 1);
+    });
+    getModalMappingSelects().forEach((select) => {
+      select.addEventListener("change", () => {
+        if (!state.activeMappingSheet) return;
+        renderMappingPreview(state.activeMappingSheet);
+      });
+    });
 
     elements.resetBtn.addEventListener("click", async () => {
       await clearDB();
@@ -1354,6 +1689,8 @@
     const arrayBuffer = await file.arrayBuffer();
     const workbook = XLSX.read(arrayBuffer, { type: "array" });
     const sheetNames = workbook.SheetNames;
+    state.workbook = workbook;
+    state.sheetNames = sheetNames;
     state.previewMeta = analyzeWorkbookPreview(workbook, sheetNames);
     updateFileMeta(file, sheetNames);
     renderSheetList(sheetNames);
@@ -1366,6 +1703,9 @@
     setupSorting();
     updateCartUI();
     setViewMode(window.innerWidth < 960 ? "cards" : "table");
+    state.customMappings = loadCustomMappings();
+    state.mappingTemplates = loadMappingTemplates();
+    refreshTemplateSelect();
     const hasCache = await initFromCache();
     if (!hasCache) showScreen("upload");
   }

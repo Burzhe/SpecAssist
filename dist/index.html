@@ -40,6 +40,7 @@
             <button id="select-none-btn">Снять выбор</button>
           </div>
           <div id="sheet-list" class="sheet-list"></div>
+          <button id="mapping-btn" class="ghost">⚙️ Настроить колонки</button>
           <button id="import-btn" class="primary" disabled>Импортировать и индексировать</button>
         </div>
 
@@ -209,6 +210,53 @@
     </div>
   </div>
 
+  <div id="column-mapping-modal" class="modal hidden">
+    <div class="modal-content mapping-modal">
+      <button id="close-column-mapping" class="close">×</button>
+      <h3>Настройка колонок</h3>
+      <p>Лист: <strong id="mapping-sheet-name"></strong></p>
+      <div class="mapping-toolbar">
+        <button id="mapping-auto-btn" class="ghost">🤖 Авто-определить</button>
+        <label><input type="checkbox" id="mapping-apply-all" /> Применить ко всем листам</label>
+        <label>
+          Шаблон:
+          <select id="mapping-template-select"></select>
+        </label>
+        <button id="mapping-template-save" class="ghost">💾 Сохранить шаблон</button>
+      </div>
+      <div class="mapping-grid">
+        <div>
+          <label for="mapping-name">Наименование</label>
+          <select id="mapping-name" data-mapping="name_col"></select>
+        </div>
+        <div>
+          <label for="mapping-dims">Размеры (Ш×Г×В)</label>
+          <select id="mapping-dims" data-mapping="dims_col"></select>
+        </div>
+        <div>
+          <label for="mapping-desc">Описание / Материал</label>
+          <select id="mapping-desc" data-mapping="desc_col"></select>
+        </div>
+        <div>
+          <label for="mapping-qty">Количество</label>
+          <select id="mapping-qty" data-mapping="qty_col"></select>
+        </div>
+        <div>
+          <label for="mapping-price">Цена за ед.</label>
+          <select id="mapping-price" data-mapping="price_unit_col"></select>
+        </div>
+        <div>
+          <label for="mapping-total">Итого</label>
+          <select id="mapping-total" data-mapping="total_col"></select>
+        </div>
+      </div>
+      <div id="mapping-preview"></div>
+      <div class="mapping-footer">
+        <button id="mapping-save-btn" class="primary">Сохранить настройку</button>
+      </div>
+    </div>
+  </div>
+
   <aside id="cart-drawer" class="cart-drawer">
     <div class="cart-header">
       <h3>Корзина</h3>
@@ -282,7 +330,7 @@
       "порошк",
     ];
 
-    const HEADER_SCAN_ROWS = 50;
+    const HEADER_SCAN_ROWS = 120;
     let idCounter = 1;
 
     function normalizeHeaderText(value) {
@@ -296,42 +344,38 @@
     function matchHeaderToField(normalized) {
       if (!normalized || normalized === "nan") return null;
       if (normalized.includes("артикул")) return null;
-      const hasPrice = normalized.includes("цена");
-      if (normalized.includes("итого")) return "total";
-      if (normalized.includes("наимен")) return "name";
-      if (normalized.includes("размер") || normalized.includes("шхгхв")) return "dims";
-      if (normalized.includes("материал") || normalized.includes("описан")) return "desc";
-      if (normalized.includes("колво") || normalized.includes("кол")) return "qty";
+      const hasPrice = /(цена|стоим|руб)/.test(normalized);
+      if (/(итого|сумма|всего)/.test(normalized)) return "total";
+      if (/(наимен|товар|номенклат|издел|позици|item|product)/.test(normalized)) return "name";
+      if (/(размер|габарит|шхгхв|шир|выс|глуб|длин)/.test(normalized)) return "dims";
+      if (/(материал|описан|коммент|примечан)/.test(normalized)) return "desc";
+      if (/(колич|кол-?во|кол\b|qty|шт)/.test(normalized)) return "qty";
       if (normalized.includes("комментар")) return "comment";
       if (normalized.includes("ед") && (normalized.includes("изм") || normalized.includes("едизм")) && !hasPrice) {
         return "unit";
       }
       if (hasPrice && normalized.includes("материал")) return "price_material";
       if (hasPrice && (normalized.includes("монтаж") || normalized.includes("достав"))) return "price_install";
-      if (hasPrice && (normalized.includes("издел") || (normalized.includes("ед") && normalized.includes("изм")))) {
+      if (hasPrice && (normalized.includes("издел") || normalized.includes("позици") || normalized.includes("шт") || normalized.includes("ед"))) {
         return "price_unit";
       }
+      if (hasPrice) return "price_unit";
       return null;
-    }
-
-    function isHeaderMatch(values, normalized) {
-      const normalizedClean = normalized.filter((text) => text && text !== "nan");
-      const hasName = normalizedClean.some((text) => text.includes("наимен"));
-      const hasPosition = normalized.some((text, idx) => text.includes("позиция") || String(values[idx] || "").includes("№"));
-      const hasPriceQty = normalizedClean.some((text) => ["кол", "итого", "цена"].some((token) => text.includes(token)));
-      return hasName && hasPosition && hasPriceQty;
     }
 
     function detectHeaderRow(rows) {
+      let best = { idx: null, score: 0 };
       for (let rowIdx = 0; rowIdx < rows.length; rowIdx += 1) {
         const row = rows[rowIdx] || [];
-        const values = row.filter((value) => value !== null && value !== undefined);
+        const values = row.filter((value) => value !== null && value !== undefined && String(value).trim() !== "");
         if (!values.length) continue;
         const normalized = row.map(normalizeHeaderText);
         if (!normalized.some((text) => text && text !== "nan")) continue;
-        if (isHeaderMatch(row, normalized)) return rowIdx;
+        const { mapping } = detectSheetMapping(row);
+        const score = Object.values(mapping).filter((value) => value !== null).length;
+        if (score > best.score) best = { idx: rowIdx, score };
       }
-      return null;
+      return best.score >= 1 ? best.idx : null;
     }
 
     function detectSheetMapping(headerRow) {
@@ -356,8 +400,43 @@
         const key = `${canonical}_col`;
         if (mapping[key] === null) mapping[key] = idx;
       });
-      const confidence = mapping.name_col !== null ? 1.0 : 0.0;
+      const matches = Object.values(mapping).filter((value) => value !== null).length;
+      const confidence = matches ? Math.min(matches / 5, 1) : 0.0;
       return { mapping, confidence, stats };
+    }
+
+    function normalizeMapping(input) {
+      const mapping = {
+        name_col: null,
+        dims_col: null,
+        desc_col: null,
+        qty_col: null,
+        unit_col: null,
+        price_material_col: null,
+        price_install_col: null,
+        price_unit_col: null,
+        total_col: null,
+        comment_col: null,
+      };
+      if (!input) return mapping;
+      Object.keys(mapping).forEach((key) => {
+        if (input[key] !== undefined && input[key] !== null && input[key] !== "") {
+          mapping[key] = Number(input[key]);
+        }
+      });
+      return mapping;
+    }
+
+    function getMappingForSheet(sheetName, headerRowValues, customMappings) {
+      const customSheet = customMappings?.sheets?.[sheetName];
+      if (customSheet) {
+        return { mapping: normalizeMapping(customSheet), source: "manual", confidence: 1 };
+      }
+      if (customMappings?.global) {
+        return { mapping: normalizeMapping(customMappings.global), source: "manual-global", confidence: 1 };
+      }
+      const detected = detectSheetMapping(headerRowValues || []);
+      return { mapping: detected.mapping, source: "auto", confidence: detected.confidence };
     }
 
     function normalizeString(value) {
@@ -460,7 +539,7 @@
     function parseRow(row, mapping, sheetName, sourceRow) {
       const rawName = mapping.name_col !== null ? row[mapping.name_col] : null;
       const name = normalizeString(rawName);
-      if (!name || typeof rawName !== "string") return [null, null];
+      if (!name) return [null, null];
       const description = normalizeString(mapping.desc_col !== null ? row[mapping.desc_col] : null);
 
       let [wMm, dMm, hMm] = parseDimensions(mapping.dims_col !== null ? row[mapping.dims_col] : null);
@@ -481,6 +560,11 @@
 
       if (priceUnitExVat === null || priceUnitExVat <= 0) return [null, null];
 
+      const widthM = wMm ? wMm / 1000 : null;
+      const heightM = hMm ? hMm / 1000 : null;
+      const pricePerLm = widthM ? priceUnitExVat / widthM : null;
+      const pricePerM2 = widthM && heightM ? priceUnitExVat / (widthM * heightM) : null;
+
       const flagsText = normalizeForFlags(`${name || ""} ${description || ""}`);
       const flags = {};
       Object.entries(FLAG_TOKENS).forEach(([flag, tokens]) => {
@@ -499,6 +583,8 @@
         qty,
         price_unit_ex_vat: priceUnitExVat,
         price_total_ex_vat: priceTotalExVat,
+        price_per_lm: pricePerLm,
+        price_per_m2: pricePerM2,
         has_led: flags.has_led,
         mat_ldsp: flags.mat_ldsp,
         mat_mdf: flags.mat_mdf,
@@ -582,7 +668,8 @@
     self.onmessage = async (event) => {
       const { type, payload } = event.data;
       if (type !== "start") return;
-      const { arrayBuffer, fileName, sheetNames, selectedSheets } = payload;
+      const { arrayBuffer, fileName, sheetNames, selectedSheets, customMappings } = payload;
+      console.info("[worker] start", { fileName, sheets: sheetNames?.length, selectedSheets });
       idCounter = 1;
       const workbook = XLSX.read(arrayBuffer, { type: "array" });
       const actualSheets = sheetNames || workbook.SheetNames;
@@ -613,7 +700,7 @@
           blankrows: false,
           raw: true,
         });
-        const headerRowIdx = detectHeaderRow(previewRows);
+        let headerRowIdx = detectHeaderRow(previewRows);
         let mapping = null;
         let headerRow = null;
         let rowsTotal = 0;
@@ -621,30 +708,24 @@
         let rowsSkipped = 0;
         let confidence = 0;
         let columns = [];
+        let mappingSource = "auto";
 
-        if (headerRowIdx !== null) {
-          headerRow = headerRowIdx + 1;
-          const headerRowValues = previewRows[headerRowIdx] || [];
-          const mappingResult = detectSheetMapping(headerRowValues);
-          mapping = mappingResult.mapping;
-          confidence = mappingResult.confidence;
-          columns = headerRowValues.map((value) => (value === null || value === undefined ? "" : String(value)));
-        } else {
-          mapping = {
-            name_col: null,
-            dims_col: null,
-            desc_col: null,
-            qty_col: null,
-            unit_col: null,
-            price_material_col: null,
-            price_install_col: null,
-            price_unit_col: null,
-            total_col: null,
-            comment_col: null,
-          };
+        let headerRowValues = headerRowIdx !== null ? previewRows[headerRowIdx] || [] : [];
+        const mappingResult = getMappingForSheet(sheetName, headerRowValues, customMappings);
+        mapping = mappingResult.mapping;
+        confidence = mappingResult.confidence;
+        mappingSource = mappingResult.source;
+        if (headerRowIdx === null && mappingSource.startsWith("manual")) {
+          headerRowIdx = 0;
+          headerRowValues = previewRows[headerRowIdx] || [];
         }
+        headerRow = headerRowIdx !== null ? headerRowIdx + 1 : null;
+        columns = headerRowValues.map((value) => (value === null || value === undefined ? "" : String(value)));
+        console.info("[worker] mapping", { sheetName, mappingSource, headerRow: headerRowIdx, mapping });
 
-        const detected = confidence >= 0.35 && mapping.name_col !== null;
+        const detected = mappingSource.startsWith("manual")
+          ? mapping.name_col !== null
+          : confidence >= 0.35 && mapping.name_col !== null;
         if (mapping.price_unit_col === null) summary.sheets_missing_price_unit += 1;
         if (mapping.qty_col === null) summary.sheets_missing_qty += 1;
         const missingCritical = !mapping.name_col || (mapping.price_unit_col === null && (mapping.total_col === null || mapping.qty_col === null));
@@ -662,29 +743,42 @@
             const row = allRows[rowIdx];
             if (!row || !row.length) continue;
             rowsTotal += 1;
+            summary.rows_total += 1;
             const sourceRow = headerRowIdx + 2 + rowIdx;
             const [parsed, priceSource] = parseRow(row, mapping, sheetName, sourceRow);
             if (!parsed) {
               rowsSkipped += 1;
+              summary.rows_skipped += 1;
               continue;
             }
             itemsChunk.push(parsed);
             rowsInserted += 1;
+            summary.rows_inserted += 1;
             if (priceSource === "price_unit") summary.rows_unit_price_from_unit += 1;
             if (priceSource === "total_div_qty") summary.rows_unit_price_from_total_qty += 1;
             if (itemsChunk.length >= 500) {
               self.postMessage({ type: "items", payload: { items: itemsChunk } });
               itemsChunk = [];
             }
+            if (rowsTotal % 500 === 0) {
+              self.postMessage({
+                type: "progress",
+                payload: {
+                  sheetIndex,
+                  sheetName,
+                  rowsTotal,
+                  rowsInserted,
+                  rowsSkipped,
+                  sheetsTotal: targetSheets.length,
+                  summary,
+                },
+              });
+            }
           }
         }
         if (itemsChunk.length) {
           self.postMessage({ type: "items", payload: { items: itemsChunk } });
         }
-
-        summary.rows_total += rowsTotal;
-        summary.rows_inserted += rowsInserted;
-        summary.rows_skipped += rowsSkipped;
 
         sheetReports.push({
           sheet_name: sheetName,
@@ -694,6 +788,7 @@
           rows_skipped: rowsSkipped,
           mapping,
           columns,
+          mapping_source: mappingSource,
           missing_critical_fields: missingCritical ? ["name", "price_source"].filter(Boolean) : [],
         });
 
@@ -706,6 +801,7 @@
             rowsInserted,
             rowsSkipped,
             sheetsTotal: targetSheets.length,
+            summary,
           },
         });
       }
