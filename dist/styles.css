@@ -11,6 +11,10 @@
   --shadow: 0 8px 24px rgba(17, 35, 74, 0.08);
   --success: #2fbf71;
   --warning: #f0b429;
+  --drop-bg: #f9fbff;
+  --drop-bg-active: #eef2ff;
+  --file-meta-bg: #f0f3ff;
+  --sheet-list-bg: #fbfcff;
 }
 
 * {
@@ -32,6 +36,10 @@ body.dark {
   --muted: #9aa6c3;
   --border: #22304d;
   --shadow: 0 10px 24px rgba(7, 12, 24, 0.5);
+  --drop-bg: #141b2e;
+  --drop-bg-active: #1d2744;
+  --file-meta-bg: #1a233b;
+  --sheet-list-bg: #0f1424;
 }
 
 .app-header {
@@ -72,6 +80,10 @@ body.dark {
   border: 1px solid var(--border);
 }
 
+.results-card {
+  position: relative;
+}
+
 .screen {
   display: none;
   gap: 24px;
@@ -86,13 +98,13 @@ body.dark {
   border-radius: 16px;
   padding: 32px;
   text-align: center;
-  background: #f9fbff;
+  background: var(--drop-bg);
   position: relative;
 }
 
 .drop-zone.dragover {
   border-color: var(--primary);
-  background: #eef2ff;
+  background: var(--drop-bg-active);
 }
 
 .drop-zone input[type="file"] {
@@ -106,7 +118,7 @@ body.dark {
 .file-meta {
   margin-top: 16px;
   padding: 12px;
-  background: #f0f3ff;
+  background: var(--file-meta-bg);
   border-radius: 12px;
   font-size: 14px;
 }
@@ -127,7 +139,7 @@ body.dark {
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 12px;
-  background: #fbfcff;
+  background: var(--sheet-list-bg);
   margin-bottom: 12px;
 }
 
@@ -136,6 +148,21 @@ body.dark {
   align-items: center;
   gap: 8px;
   padding: 6px 0;
+}
+
+.sheet-status {
+  font-size: 14px;
+  width: 20px;
+  text-align: center;
+}
+
+.sheet-status.ok {
+  color: var(--success);
+}
+
+.sheet-status.warn,
+.sheet-status.error {
+  color: var(--danger);
 }
 
 button {
@@ -402,6 +429,17 @@ progress {
   border-radius: 8px;
   background: linear-gradient(90deg, rgba(47, 94, 246, 0.08), rgba(47, 94, 246, 0.2), rgba(47, 94, 246, 0.08));
   animation: shimmer 1.2s infinite;
+}
+
+.scroll-skeleton {
+  position: absolute;
+  left: 24px;
+  right: 24px;
+  top: 160px;
+  display: grid;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 2;
 }
 
 @keyframes shimmer {
@@ -712,6 +750,14 @@ progress {
 
 .col-dims {
   background: rgba(240, 180, 41, 0.2);
+}
+
+.result-row {
+  animation: fadeInUp 0.2s ease;
+}
+
+.card-item {
+  animation: fadeInUp 0.25s ease;
 }
 
 @keyframes fadeInUp {

@@ -138,7 +138,7 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="card results-card">
         <div class="results-header">
           <h2>Результаты</h2>
           <div class="results-actions">
@@ -153,7 +153,7 @@
         <div id="results-empty" class="empty-state hidden">
           <div class="empty-illustration">🪄</div>
           <h3>Ничего не найдено</h3>
-          <p>Попробуйте увеличить толерантность размеров или снять фильтр по LED.</p>
+          <p data-empty-hint>Попробуйте увеличить толерантность размеров или снять фильтр по LED.</p>
           <div class="empty-actions">
             <button id="increase-tol-btn" class="ghost">Увеличить ±50мм</button>
             <button id="remove-led-btn" class="ghost">Убрать фильтр LED</button>
@@ -161,6 +161,11 @@
         </div>
         <div id="results-loading" class="results-loading hidden">
           <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+        </div>
+        <div id="scroll-skeleton" class="scroll-skeleton hidden">
           <div class="skeleton-row"></div>
           <div class="skeleton-row"></div>
           <div class="skeleton-row"></div>

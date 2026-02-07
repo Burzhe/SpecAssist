@@ -37,6 +37,8 @@
     worker: null,
     searchTimer: null,
     filterTimer: null,
+    previewMeta: {},
+    scrollTimer: null,
     progress: {
       sheetsTotal: 0,
       sheetsDone: 0,
@@ -71,6 +73,7 @@
     resultsSummary: document.getElementById("results-summary"),
     resultsEmpty: document.getElementById("results-empty"),
     resultsLoading: document.getElementById("results-loading"),
+    scrollSkeleton: document.getElementById("scroll-skeleton"),
     cardsView: document.getElementById("cards-view"),
     tableWrap: document.getElementById("table-wrap"),
     detailsDrawer: document.getElementById("details-drawer"),
@@ -336,6 +339,35 @@
     elements.resetFiltersBtn.classList.toggle("hidden", count === 0);
   }
 
+  function logSearchDiagnostics(stage, payload) {
+    if (!payload) return;
+    console.info(`[search] ${stage}`, payload);
+  }
+
+  function updateEmptyState({ queryItems, filters, results }) {
+    if (results.length) {
+      elements.increaseTolBtn.disabled = false;
+      elements.removeLedBtn.disabled = false;
+      return;
+    }
+    const hints = [];
+    const dimsActive = Object.values(filters.dims).some((dim) => Number.isFinite(dim.min) || Number.isFinite(dim.max));
+    if (dimsActive) hints.push("Попробуйте увеличить толерантность размеров.");
+    if (filters.flags.has_led === true) {
+      const relaxedFlags = { ...filters.flags };
+      delete relaxedFlags.has_led;
+      const relaxedItems = applyFilters(queryItems, { ...filters, flags: relaxedFlags });
+      if (relaxedItems.length) {
+        hints.push(`Найдено 0 с LED, но ${relaxedItems.length} без подсветки — убрать фильтр?`);
+      }
+    }
+    elements.increaseTolBtn.disabled = !dimsActive;
+    elements.removeLedBtn.disabled = filters.flags.has_led !== true;
+    const hintText = hints.length ? hints.join(" ") : "Попробуйте изменить запрос или снять часть фильтров.";
+    const hintEl = elements.resultsEmpty.querySelector("[data-empty-hint]");
+    if (hintEl) hintEl.textContent = hintText;
+  }
+
   function getSelectedSheets() {
     const selected = [];
     elements.sheetList.querySelectorAll("input[type='checkbox']").forEach((checkbox) => {
@@ -474,6 +506,7 @@
     state.lastResults = items;
     elements.resultsSummary.textContent = `Найдено: ${items.length}`;
     elements.resultsEmpty.classList.toggle("hidden", items.length > 0);
+    elements.scrollSkeleton.classList.add("hidden");
 
     const renderTableSlice = (start, end) => {
       elements.resultsTableBody.innerHTML = "";
@@ -485,6 +518,7 @@
       fragment.appendChild(topSpacer);
       items.slice(start, end).forEach((item) => {
         const tr = document.createElement("tr");
+        tr.className = "result-row";
         tr.innerHTML = `
           <td><input type="checkbox" data-compare="${item.id}" ${state.compareIds.has(item.id) ? "checked" : ""} /></td>
           <td>${item.name || ""}</td>
@@ -564,7 +598,17 @@
       });
     };
 
-    const renderWithVirtualization = () => {
+    const triggerScrollSkeleton = () => {
+      if (!items.length) return;
+      elements.scrollSkeleton.classList.remove("hidden");
+      clearTimeout(state.scrollTimer);
+      state.scrollTimer = setTimeout(() => {
+        elements.scrollSkeleton.classList.add("hidden");
+      }, 200);
+    };
+
+    const renderWithVirtualization = (isScroll = false) => {
+      if (isScroll) triggerScrollSkeleton();
       if (state.viewMode === "table") {
         const rowHeight = 44;
         const visibleCount = Math.ceil(elements.tableWrap.clientHeight / rowHeight) + 10;
@@ -579,8 +623,8 @@
     };
 
     renderWithVirtualization();
-    elements.tableWrap.onscroll = renderWithVirtualization;
-    elements.cardsView.onscroll = renderWithVirtualization;
+    elements.tableWrap.onscroll = () => renderWithVirtualization(true);
+    elements.cardsView.onscroll = () => renderWithVirtualization(true);
     updateCompareButton();
   }
 
@@ -914,16 +958,22 @@
   async function handleSearch() {
     elements.resultsLoading.classList.remove("hidden");
     const filters = getFilterValues();
-    let items = state.items;
+    const baseItems = state.items;
+    updateFilterCounts(baseItems);
+    logSearchDiagnostics("filters", filters);
+    let items = baseItems;
     if (filters.query) {
       const ids = state.index ? state.index.search(filters.query.toLowerCase(), { limit: 5000 }) : [];
       const idSet = new Set(ids);
       items = items.filter((item) => idSet.has(item.id));
     }
-    updateFilterCounts(items);
+    logSearchDiagnostics("after-text-search", { count: items.length, total: baseItems.length });
+    const queryItems = items;
     items = applyFilters(items, filters);
+    logSearchDiagnostics("after-filters", { count: items.length });
     items = sortResults(items);
     renderResults(items);
+    updateEmptyState({ queryItems, filters, results: items });
     updateActiveFilters(filters);
     elements.resultsLoading.classList.add("hidden");
   }
@@ -951,7 +1001,14 @@
     sheetNames.forEach((name) => {
       const wrapper = document.createElement("label");
       wrapper.className = "sheet-item";
-      wrapper.innerHTML = `<input type="checkbox" value="${name}" checked /> ${name}`;
+      const status = state.previewMeta[name]?.status;
+      const statusIcon = status === "ok" ? "✅" : "❌";
+      const statusTitle = status === "ok" ? "Структура распознана" : "Проверьте структуру листа";
+      wrapper.innerHTML = `
+        <input type="checkbox" value="${name}" checked />
+        <span class="sheet-status ${status}" title="${statusTitle}">${statusIcon}</span>
+        <span>${name}</span>
+      `;
       elements.sheetList.appendChild(wrapper);
     });
     elements.sheetOptions.classList.remove("hidden");
@@ -965,6 +1022,36 @@
     if (/(цен|price|стоим)/.test(normalized)) return "price";
     if (/(размер|width|height|depth|шир|выс|глуб|длина|w|h|d)/.test(normalized)) return "dims";
     return null;
+  }
+
+  function detectPreviewHeader(rows) {
+    let best = { index: 0, score: 0, classified: [] };
+    rows.forEach((row, idx) => {
+      const classified = (row || []).map((value) => classifyHeader(value));
+      const score = classified.filter(Boolean).length;
+      if (score > best.score) best = { index: idx, score, classified };
+    });
+    return best;
+  }
+
+  function analyzeWorkbookPreview(workbook, sheetNames) {
+    const meta = {};
+    sheetNames.forEach((name) => {
+      const sheet = workbook.Sheets[name];
+      if (!sheet) return;
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false, raw: true }).slice(0, 12);
+      if (!rows.length) {
+        meta[name] = { status: "error", headerRowIndex: null, headers: [], classified: [] };
+        return;
+      }
+      const detected = detectPreviewHeader(rows);
+      const headerRowIndex = detected.score >= 2 ? detected.index : 0;
+      const headers = rows[headerRowIndex] || [];
+      const classified = detected.score >= 2 ? detected.classified : headers.map((value) => classifyHeader(value));
+      const status = detected.score >= 2 ? "ok" : "warn";
+      meta[name] = { status, headerRowIndex, headers, classified };
+    });
+    return meta;
   }
 
   function renderSheetPreview(workbook, sheetNames) {
@@ -987,19 +1074,22 @@
 
     const renderPreviewTable = (name) => {
       const sheet = workbook.Sheets[name];
-      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 }).slice(0, 10);
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false }).slice(0, 12);
       if (!rows.length) {
         elements.sheetPreviewContent.innerHTML = "<p>Нет данных для предпросмотра.</p>";
         return;
       }
-      const headers = rows[0];
+      const meta = state.previewMeta[name] || detectPreviewHeader(rows);
+      const headerRowIndex = meta.headerRowIndex ?? 0;
+      const headers = rows[headerRowIndex] || [];
+      const classified = meta.classified || headers.map((value) => classifyHeader(value));
       const table = document.createElement("table");
       table.className = "preview-table";
       const thead = document.createElement("thead");
       const headerRow = document.createElement("tr");
-      headers.forEach((header) => {
+      headers.forEach((header, idx) => {
         const th = document.createElement("th");
-        const type = classifyHeader(header);
+        const type = classified[idx] || classifyHeader(header);
         if (type === "name") th.classList.add("col-name");
         if (type === "price") th.classList.add("col-price");
         if (type === "dims") th.classList.add("col-dims");
@@ -1009,10 +1099,14 @@
       thead.appendChild(headerRow);
       table.appendChild(thead);
       const tbody = document.createElement("tbody");
-      rows.slice(1).forEach((row) => {
+      rows.slice(headerRowIndex + 1).forEach((row) => {
         const tr = document.createElement("tr");
         headers.forEach((_, idx) => {
           const td = document.createElement("td");
+          const type = classified[idx];
+          if (type === "name") td.classList.add("col-name");
+          if (type === "price") td.classList.add("col-price");
+          if (type === "dims") td.classList.add("col-dims");
           td.textContent = row[idx] ?? "";
           tr.appendChild(td);
         });
@@ -1260,6 +1354,7 @@
     const arrayBuffer = await file.arrayBuffer();
     const workbook = XLSX.read(arrayBuffer, { type: "array" });
     const sheetNames = workbook.SheetNames;
+    state.previewMeta = analyzeWorkbookPreview(workbook, sheetNames);
     updateFileMeta(file, sheetNames);
     renderSheetList(sheetNames);
     renderSheetPreview(workbook, sheetNames);
