@@ -5,24 +5,32 @@
   const STORE_META = "meta";
 
   const CATEGORY_STEMS = {
-    "шкаф": ["шкаф", "пенал", "гардероб", "купе"],
-    "стеллаж": ["стеллаж", "стелаж", "стелл"],
-    "кухня": ["кухн"],
-    "стол": ["стол", "столешн", "столик"],
-    "бенч-стол": ["бенч", "bench", "бенч-стол"],
-    "бар": ["бар", "барн", "стойк"],
-    "дверь": ["двер", "дверн"],
-    "перила": ["перил", "поручн"],
-    "зеркало": ["зеркал"],
+    "Шкафы": ["шкаф", "пенал", "гардероб", "купе", "встроен"],
+    "Стеллажи": ["стеллаж", "стелл", "этажерк"],
+    "Кухни": ["кухн", "столешниц", "фартук"],
+    "Столы": ["стол", "столик", "парт"],
+    "Кресла и стулья": ["кресл", "стул", "табурет", "пуф"],
+    "Бары и стойки": ["бар", "стойк", "ресепшн"],
+    "Двери": ["двер", "дверн", "полотн"],
+    "Перегородки": ["перегород", "перил", "поручн"],
+    "Зеркала": ["зеркал"],
+    "Освещение": ["светильн", "люстр", "бра", "торшер", "подсветк"],
+    "Мягкая мебель": ["диван", "кровать", "матрас"],
+    "Офисная мебель": ["офисн", "рабоч.*мест", "кабинет"],
+    "Детская мебель": ["детск", "подростк"],
+    "Фурнитура": ["ручк", "петл", "направляющ", "фурнитур"],
+    "Прочее": [],
   };
 
   const FLAG_LABELS = {
-    has_led: "LED",
     mat_ldsp: "ЛДСП",
     mat_mdf: "МДФ",
     mat_veneer: "Шпон",
     has_glass: "Стекло",
     has_metal: "Металл",
+    has_led: "LED",
+    has_stone: "Камень",
+    has_acrylic: "Акрил",
   };
 
   const MAPPING_FIELDS = [
@@ -36,6 +44,7 @@
 
   const MAPPING_STORAGE_KEY = "specassist_custom_mappings";
   const TEMPLATE_STORAGE_KEY = "specassist_mapping_templates";
+  const FILTER_STORAGE_KEY = "specassist_last_search";
 
   const state = {
     items: [],
@@ -45,7 +54,6 @@
     sortDir: "asc",
     viewMode: "table",
     compareIds: new Set(),
-    cartItems: [],
     worker: null,
     searchTimer: null,
     filterTimer: null,
@@ -112,18 +120,9 @@
     compareBtn: document.getElementById("compare-btn"),
     compareModal: document.getElementById("compare-modal"),
     compareTable: document.getElementById("compare-table"),
+    compareSummary: document.getElementById("compare-summary"),
     closeCompare: document.getElementById("close-compare"),
     themeToggle: document.getElementById("theme-toggle"),
-    cartBtn: document.getElementById("cart-btn"),
-    cartCount: document.getElementById("cart-count"),
-    cartDrawer: document.getElementById("cart-drawer"),
-    closeCart: document.getElementById("close-cart"),
-    cartItems: document.getElementById("cart-items"),
-    cartTotalItems: document.getElementById("cart-total-items"),
-    cartTotalPrice: document.getElementById("cart-total-price"),
-    cartAvgPrice: document.getElementById("cart-avg-price"),
-    cartTotalVolume: document.getElementById("cart-total-volume"),
-    cartExportBtn: document.getElementById("cart-export-btn"),
     columnMappingModal: document.getElementById("column-mapping-modal"),
     closeColumnMapping: document.getElementById("close-column-mapping"),
     mappingSheetName: document.getElementById("mapping-sheet-name"),
@@ -541,7 +540,30 @@
     return options;
   }
 
-  function suggestMapping(headers) {
+  function analyzeColumnContent(values) {
+    const samples = values.filter((v) => v != null).slice(0, 20);
+    if (!samples.length) return { type: null, confidence: 0 };
+
+    let dimMatches = 0;
+    let priceMatches = 0;
+    let nameMatches = 0;
+
+    samples.forEach((val) => {
+      const str = String(val).toLowerCase();
+      if (/\d{2,4}\s*[x×*]\s*\d{2,4}/.test(str)) dimMatches += 1;
+      if (/^\d{1,8}([.,]\d{1,2})?$/.test(str) && parseFloat(str) > 100) priceMatches += 1;
+      if (str.length > 10 && /[а-я]{3,}/.test(str)) nameMatches += 1;
+    });
+
+    const total = samples.length;
+    if (dimMatches / total > 0.5) return { type: "dims", confidence: dimMatches / total };
+    if (priceMatches / total > 0.6) return { type: "price", confidence: priceMatches / total };
+    if (nameMatches / total > 0.7) return { type: "name", confidence: nameMatches / total };
+
+    return { type: null, confidence: 0 };
+  }
+
+  function suggestMapping(headers, sampleRows = []) {
     const suggestions = {};
     headers.forEach((header, idx) => {
       const normalized = normalizeText(String(header || ""));
@@ -565,6 +587,31 @@
         suggestions.total_col = idx;
       }
     });
+
+    if (sampleRows.length) {
+      const maxCols = Math.max(
+        headers.length,
+        ...sampleRows.map((row) => (row ? row.length : 0)),
+      );
+      const usedCols = new Set(Object.values(suggestions).filter((value) => value !== undefined));
+      for (let colIdx = 0; colIdx < maxCols; colIdx += 1) {
+        if (usedCols.has(colIdx)) continue;
+        const values = sampleRows.map((row) => (row ? row[colIdx] : null));
+        const analysis = analyzeColumnContent(values);
+        if (analysis.type === "name" && suggestions.name_col === undefined) {
+          suggestions.name_col = colIdx;
+          usedCols.add(colIdx);
+        }
+        if (analysis.type === "dims" && suggestions.dims_col === undefined) {
+          suggestions.dims_col = colIdx;
+          usedCols.add(colIdx);
+        }
+        if (analysis.type === "price" && suggestions.price_unit_col === undefined) {
+          suggestions.price_unit_col = colIdx;
+          usedCols.add(colIdx);
+        }
+      }
+    }
     return suggestions;
   }
 
@@ -711,6 +758,48 @@
     };
   }
 
+  function saveFiltersToLocalStorage(filters) {
+    localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filters));
+  }
+
+  function loadFiltersFromLocalStorage() {
+    const saved = localStorage.getItem(FILTER_STORAGE_KEY);
+    if (!saved) return null;
+    try {
+      return JSON.parse(saved);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function applyFiltersToUI(filters) {
+    if (!filters) return;
+    elements.searchInput.value = filters.query || "";
+    elements.categoryFilter.value = filters.category || "";
+    elements.flagFilters.querySelectorAll("select[data-flag]").forEach((select) => {
+      const flag = select.dataset.flag;
+      if (filters.flags?.[flag] === true) select.value = "yes";
+      else if (filters.flags?.[flag] === false) select.value = "no";
+      else select.value = "";
+    });
+
+    const dims = filters.dims || {};
+    const setDimValues = (key, inputMin, inputMax, inputTol, rangeMin, rangeMax) => {
+      const config = dims[key] || {};
+      inputMin.value = Number.isFinite(config.min) ? config.min : "";
+      inputMax.value = Number.isFinite(config.max) ? config.max : "";
+      inputTol.value = Number.isFinite(config.tol) ? config.tol : "";
+      rangeMin.value = Number.isFinite(config.min) ? config.min : 0;
+      rangeMax.value = Number.isFinite(config.max) ? config.max : rangeMax.max;
+    };
+    setDimValues("w", dimInputs.wMin, dimInputs.wMax, dimInputs.wTol, dimInputs.wMinRange, dimInputs.wMaxRange);
+    setDimValues("d", dimInputs.dMin, dimInputs.dMax, dimInputs.dTol, dimInputs.dMinRange, dimInputs.dMaxRange);
+    setDimValues("h", dimInputs.hMin, dimInputs.hMax, dimInputs.hTol, dimInputs.hMinRange, dimInputs.hMaxRange);
+
+    priceInputs.min.value = Number.isFinite(filters.price?.min) ? filters.price.min : "";
+    priceInputs.max.value = Number.isFinite(filters.price?.max) ? filters.price.max : "";
+  }
+
   function withinRange(value, min, max, tol) {
     if (value === null || value === undefined) return false;
     const minVal = Number.isFinite(min) ? min - (Number.isFinite(tol) ? tol : 0) : null;
@@ -728,19 +817,30 @@
         if (required === false && item[flag]) return false;
       }
 
-      const dimsMap = {
-        w: "w_mm",
-        d: "d_mm",
-        h: "h_mm",
-      };
-      for (const [key, config] of Object.entries(filters.dims)) {
-        const min = config.min;
-        const max = config.max;
-        const tol = config.tol;
-        if (Number.isFinite(min) || Number.isFinite(max)) {
-          const value = item[dimsMap[key]];
-          if (!withinRange(value, min, max, tol)) return false;
-        }
+      const dims = filters.dims;
+
+      if (Number.isFinite(dims.w.min) || Number.isFinite(dims.w.max)) {
+        const w = item.w_mm;
+        if (!w) return false;
+        const tol = dims.w.tol || 0;
+        if (Number.isFinite(dims.w.min) && w < dims.w.min - tol) return false;
+        if (Number.isFinite(dims.w.max) && w > dims.w.max + tol) return false;
+      }
+
+      if (Number.isFinite(dims.d.min) || Number.isFinite(dims.d.max)) {
+        const d = item.d_mm;
+        if (!d) return false;
+        const tol = dims.d.tol || 0;
+        if (Number.isFinite(dims.d.min) && d < dims.d.min - tol) return false;
+        if (Number.isFinite(dims.d.max) && d > dims.d.max + tol) return false;
+      }
+
+      if (Number.isFinite(dims.h.min) || Number.isFinite(dims.h.max)) {
+        const h = item.h_mm;
+        if (!h) return false;
+        const tol = dims.h.tol || 0;
+        if (Number.isFinite(dims.h.min) && h < dims.h.min - tol) return false;
+        if (Number.isFinite(dims.h.max) && h > dims.h.max + tol) return false;
       }
 
       if (Number.isFinite(filters.price.min) && item.price_unit_ex_vat < filters.price.min) return false;
@@ -774,7 +874,7 @@
       const total = items.length;
       const topSpacer = document.createElement("tr");
       topSpacer.className = "spacer-row";
-      topSpacer.innerHTML = `<td colspan="10" style="height:${start * 44}px"></td>`;
+      topSpacer.innerHTML = `<td colspan="11" style="height:${start * 44}px"></td>`;
       fragment.appendChild(topSpacer);
       items.slice(start, end).forEach((item) => {
         const tr = document.createElement("tr");
@@ -782,6 +882,7 @@
         tr.innerHTML = `
           <td><input type="checkbox" data-compare="${item.id}" ${state.compareIds.has(item.id) ? "checked" : ""} /></td>
           <td>${item.name || ""}</td>
+          <td>${item.description ? `${item.description.substring(0, 50)}${item.description.length > 50 ? "..." : ""}` : "—"}</td>
           <td>${item.category || "—"}</td>
           <td>${[item.w_mm, item.d_mm, item.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ")}</td>
           <td>${formatNumber(item.price_unit_ex_vat)}</td>
@@ -799,7 +900,7 @@
       });
       const bottomSpacer = document.createElement("tr");
       bottomSpacer.className = "spacer-row";
-      bottomSpacer.innerHTML = `<td colspan="10" style="height:${Math.max(total - end, 0) * 44}px"></td>`;
+      bottomSpacer.innerHTML = `<td colspan="11" style="height:${Math.max(total - end, 0) * 44}px"></td>`;
       fragment.appendChild(bottomSpacer);
       elements.resultsTableBody.appendChild(fragment);
       elements.resultsTableBody.querySelectorAll("input[data-compare]").forEach((checkbox) => {
@@ -825,12 +926,12 @@
             <strong>${item.name || "Без названия"}</strong>
             <label><input type="checkbox" data-compare="${item.id}" ${state.compareIds.has(item.id) ? "checked" : ""} /> сравнить</label>
           </div>
+          <div class="card-description">${item.description ? `${item.description.substring(0, 70)}${item.description.length > 70 ? "..." : ""}` : "—"}</div>
           <div class="dims-icon">📦 ${[item.w_mm, item.d_mm, item.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ")}</div>
           <div>Цена/ед: <strong>${formatNumber(item.price_unit_ex_vat)}</strong></div>
           <div class="card-badges">${renderBadgeChips(item) || ""}</div>
           <div class="cards-actions">
             <button class="ghost" data-details="${item.id}">Подробнее</button>
-            <button class="ghost" data-cart="${item.id}">В корзину</button>
           </div>
         `;
         fragment.appendChild(card);
@@ -840,12 +941,6 @@
         btn.addEventListener("click", () => {
           const item = items.find((entry) => entry.id === Number(btn.dataset.details));
           if (item) showDetails(item);
-        });
-      });
-      elements.cardsView.querySelectorAll("button[data-cart]").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const item = items.find((entry) => entry.id === Number(btn.dataset.cart));
-          if (item) addToCart(item);
         });
       });
       elements.cardsView.querySelectorAll("input[data-compare]").forEach((checkbox) => {
@@ -912,8 +1007,13 @@
     const compareItems = state.items.filter((item) => state.compareIds.has(item.id));
     if (!compareItems.length) return;
     const prices = compareItems.map((item) => item.price_unit_ex_vat).filter(Number.isFinite);
+    const pricesPerLm = compareItems.map((item) => item.price_per_lm).filter(Number.isFinite);
+    const pricesPerM2 = compareItems.map((item) => item.price_per_m2).filter(Number.isFinite);
     const minPrice = prices.length ? Math.min(...prices) : null;
     const maxPrice = prices.length ? Math.max(...prices) : null;
+    const minPriceM2 = pricesPerM2.length ? Math.min(...pricesPerM2) : null;
+    const maxPriceM2 = pricesPerM2.length ? Math.max(...pricesPerM2) : null;
+    const avgPriceLm = pricesPerLm.length ? pricesPerLm.reduce((sum, val) => sum + val, 0) / pricesPerLm.length : null;
 
     const rows = [
       { label: "Название", key: "name" },
@@ -945,7 +1045,12 @@
             if (price === maxPrice) cell.classList.add("highlight-worst");
           }
         } else if (row.key === "price_per_m2") {
-          cell.textContent = formatNumber(item.price_per_m2);
+          const price = item.price_per_m2;
+          cell.textContent = formatNumber(price);
+          if (Number.isFinite(price) && minPriceM2 !== null && maxPriceM2 !== null) {
+            if (price === minPriceM2) cell.classList.add("highlight-best");
+            if (price === maxPriceM2) cell.classList.add("highlight-worst");
+          }
         } else {
           cell.textContent = item[row.key] || "—";
         }
@@ -953,63 +1058,19 @@
       });
       elements.compareTable.appendChild(rowEl);
     });
+    const diffPercent = minPrice && maxPrice && minPrice > 0 ? ((maxPrice - minPrice) / minPrice) * 100 : null;
+    elements.compareSummary.innerHTML = `
+      <strong>Итоги:</strong>
+      <div>Разница в цене: ${diffPercent !== null ? `${diffPercent.toFixed(1)}%` : "—"}</div>
+      <div>Средняя цена/п.м.: ${avgPriceLm !== null ? `${formatNumber(avgPriceLm)} ₽` : "—"}</div>
+    `;
     elements.compareModal.classList.remove("hidden");
-  }
-
-  function addToCart(item) {
-    if (!state.cartItems.find((entry) => entry.id === item.id)) {
-      state.cartItems.push(item);
-      updateCartUI();
-    }
-    elements.cartDrawer.classList.add("open");
-  }
-
-  function removeFromCart(id) {
-    state.cartItems = state.cartItems.filter((item) => item.id !== id);
-    updateCartUI();
-  }
-
-  function updateCartUI() {
-    elements.cartItems.innerHTML = "";
-    let totalPrice = 0;
-    let totalAreaPrice = 0;
-    let areaCount = 0;
-    let totalVolume = 0;
-
-    state.cartItems.forEach((item) => {
-      const card = document.createElement("div");
-      card.className = "cart-item";
-      card.innerHTML = `
-        <strong>${item.name || "Без названия"}</strong>
-        <span>Цена/ед: ${formatNumber(item.price_unit_ex_vat)}</span>
-        <span>Размеры: ${[item.w_mm, item.d_mm, item.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ")}</span>
-        <button class="ghost" data-remove="${item.id}">Удалить</button>
-      `;
-      elements.cartItems.appendChild(card);
-      if (Number.isFinite(item.price_unit_ex_vat)) totalPrice += item.price_unit_ex_vat;
-      if (Number.isFinite(item.price_per_m2)) {
-        totalAreaPrice += item.price_per_m2;
-        areaCount += 1;
-      }
-      if (item.w_mm && item.d_mm && item.h_mm) {
-        totalVolume += (item.w_mm / 1000) * (item.d_mm / 1000) * (item.h_mm / 1000);
-      }
-    });
-
-    elements.cartItems.querySelectorAll("button[data-remove]").forEach((btn) => {
-      btn.addEventListener("click", () => removeFromCart(Number(btn.dataset.remove)));
-    });
-
-    elements.cartCount.textContent = state.cartItems.length;
-    elements.cartTotalItems.textContent = state.cartItems.length;
-    elements.cartTotalPrice.textContent = formatNumber(totalPrice);
-    elements.cartAvgPrice.textContent = areaCount ? formatNumber(totalAreaPrice / areaCount) : "—";
-    elements.cartTotalVolume.textContent = totalVolume ? `${totalVolume.toFixed(2)} м³` : "—";
   }
 
   function exportItemsToExcel(items, filename) {
     const rows = items.map((item) => ({
       name: item.name,
+      description: item.description,
       category: item.category,
       w_mm: item.w_mm,
       d_mm: item.d_mm,
@@ -1066,14 +1127,19 @@
   }
 
   function extractCategory(text) {
-    const tokens = tokenize(text);
-    let bestCategory = null;
+    const tokens = text.toLowerCase().match(/[а-яa-z0-9]+/gi) || [];
+    let bestCategory = "Прочее";
     let bestScore = 0;
+
     for (const [category, stems] of Object.entries(CATEGORY_STEMS)) {
+      if (category === "Прочее") continue;
       let score = 0;
       for (const token of tokens) {
         for (const stem of stems) {
-          if (token.startsWith(stem)) score += stem.length;
+          const regex = new RegExp(`^${stem}`, "i");
+          if (regex.test(token)) {
+            score += stem.length;
+          }
         }
       }
       if (score > bestScore) {
@@ -1081,6 +1147,7 @@
         bestScore = score;
       }
     }
+
     return bestCategory;
   }
 
@@ -1114,6 +1181,21 @@
       .map((entry) => entry.item);
   }
 
+  function copyItemToClipboard(item) {
+    const text = `
+${item.name || "—"}
+Размеры: ${item.w_mm || "—"}×${item.d_mm || "—"}×${item.h_mm || "—"} мм
+Количество: ${item.qty || 1}
+Цена/ед: ${formatNumber(item.price_unit_ex_vat)} ₽
+Цена/п.м.: ${formatNumber(item.price_per_lm)} ₽
+Источник: ${item.source_sheet || "—"}, строка ${item.source_row || "—"}
+    `.trim();
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text);
+      alert("Скопировано в буфер обмена!");
+    }
+  }
+
   function showDetails(item) {
     const similar = findSimilar(item);
     const compareBtnLabel = state.compareIds.has(item.id) ? "Убрать из сравнения" : "Добавить в сравнение";
@@ -1123,7 +1205,7 @@
         <p>${item.description || ""}</p>
         <div class="details-actions">
           <button id="details-compare-btn" class="ghost">${compareBtnLabel}</button>
-          <button id="details-cart-btn" class="ghost">Добавить в корзину</button>
+          <button id="details-copy-btn" class="ghost">📋 Скопировать</button>
         </div>
       </div>
       <div class="details-section">
@@ -1181,9 +1263,9 @@
         showDetails(item);
       });
     }
-    const cartBtn = elements.detailsContent.querySelector("#details-cart-btn");
-    if (cartBtn) {
-      cartBtn.addEventListener("click", () => addToCart(item));
+    const copyBtn = elements.detailsContent.querySelector("#details-copy-btn");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", () => copyItemToClipboard(item));
     }
     renderPriceChart(item, similar);
     elements.detailsDrawer.classList.add("open");
@@ -1235,6 +1317,7 @@
     renderResults(items);
     updateEmptyState({ queryItems, filters, results: items });
     updateActiveFilters(filters);
+    saveFiltersToLocalStorage(filters);
     elements.resultsLoading.classList.add("hidden");
   }
 
@@ -1466,7 +1549,6 @@
     buildIndex(items);
     updateCategoryFilter();
     showScreen("search");
-    await handleSearch();
     return true;
   }
 
@@ -1486,8 +1568,7 @@
   }
 
   function setupEventListeners() {
-    const debouncedSearch = debounce(handleSearch, 300);
-    const throttledSearch = throttle(handleSearch, 200);
+    const debouncedSearch = debounce(handleSearch, 500);
 
     elements.dropZone.addEventListener("dragover", (event) => {
       event.preventDefault();
@@ -1544,9 +1625,9 @@
     });
 
     Object.values(dimInputs).forEach((input) => {
-      input.addEventListener("change", throttledSearch);
+      input.addEventListener("input", debouncedSearch);
     });
-    Object.values(priceInputs).forEach((input) => input.addEventListener("change", throttledSearch));
+    Object.values(priceInputs).forEach((input) => input.addEventListener("input", debouncedSearch));
     elements.categoryFilter.addEventListener("change", handleSearch);
     elements.flagFilters.addEventListener("change", handleSearch);
     elements.closeDrawer.addEventListener("click", hideDetails);
@@ -1579,9 +1660,6 @@
       const isDark = document.body.classList.contains("dark");
       elements.themeToggle.textContent = isDark ? "☀️ Светлая тема" : "🌙 Тёмная тема";
     });
-    elements.cartBtn.addEventListener("click", () => elements.cartDrawer.classList.add("open"));
-    elements.closeCart.addEventListener("click", () => elements.cartDrawer.classList.remove("open"));
-    elements.cartExportBtn.addEventListener("click", () => exportItemsToExcel(state.cartItems, "specassist-cart.xlsx"));
 
     elements.closeColumnMapping.addEventListener("click", closeColumnMappingModal);
     elements.columnMappingModal.addEventListener("click", (event) => {
@@ -1591,7 +1669,11 @@
       if (!state.activeMappingSheet) return;
       const meta = state.previewMeta[state.activeMappingSheet];
       const headers = meta?.headers || [];
-      const suggested = suggestMapping(headers);
+      const sheet = state.workbook?.Sheets?.[state.activeMappingSheet];
+      const rows = sheet ? XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false, raw: true }) : [];
+      const headerRowIndex = meta?.headerRowIndex ?? 0;
+      const sampleRows = rows.slice(headerRowIndex + 1, headerRowIndex + 21);
+      const suggested = suggestMapping(headers, sampleRows);
       console.info("[mapping] auto-detect", { sheet: state.activeMappingSheet, suggested });
       applyMappingToModal(suggested);
       renderMappingPreview(state.activeMappingSheet);
@@ -1641,13 +1723,11 @@
       state.items = [];
       state.index = null;
       state.compareIds.clear();
-      state.cartItems = [];
       elements.fileInput.value = "";
       elements.sheetOptions.classList.add("hidden");
       elements.fileMeta.classList.add("hidden");
       elements.progressContainer.classList.add("hidden");
       resetProgress();
-      updateCartUI();
       updateCompareButton();
       showScreen("upload");
     });
@@ -1660,19 +1740,19 @@
     rangePairs.forEach(([minRange, maxRange, minInput, maxInput]) => {
       minRange.addEventListener("input", () => {
         syncRangePair(minRange, maxRange, minInput, maxInput);
-        throttledSearch();
+        debouncedSearch();
       });
       maxRange.addEventListener("input", () => {
         syncRangePair(minRange, maxRange, minInput, maxInput);
-        throttledSearch();
+        debouncedSearch();
       });
       minInput.addEventListener("change", () => {
         setRangeFromInput(minInput, minRange, 0);
-        throttledSearch();
+        debouncedSearch();
       });
       maxInput.addEventListener("change", () => {
         setRangeFromInput(maxInput, maxRange, maxRange.max);
-        throttledSearch();
+        debouncedSearch();
       });
     });
   }
@@ -1701,13 +1781,20 @@
     setupFlagFilters();
     setupEventListeners();
     setupSorting();
-    updateCartUI();
     setViewMode(window.innerWidth < 960 ? "cards" : "table");
     state.customMappings = loadCustomMappings();
     state.mappingTemplates = loadMappingTemplates();
     refreshTemplateSelect();
     const hasCache = await initFromCache();
-    if (!hasCache) showScreen("upload");
+    if (hasCache) {
+      const savedFilters = loadFiltersFromLocalStorage();
+      if (savedFilters) {
+        applyFiltersToUI(savedFilters);
+      }
+      await handleSearch();
+    } else {
+      showScreen("upload");
+    }
   }
 
   init();

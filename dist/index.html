@@ -14,9 +14,6 @@
     </div>
     <div class="header-actions">
       <button id="theme-toggle" class="ghost">🌙 Тёмная тема</button>
-      <button id="cart-btn" class="ghost cart-btn">
-        🧺 Корзина <span id="cart-count" class="badge">0</span>
-      </button>
       <button id="reset-btn" class="danger">Сбросить проект</button>
     </div>
   </header>
@@ -177,6 +174,7 @@
               <tr>
                 <th></th>
                 <th data-sort="name">Наименование</th>
+                <th data-sort="description">Описание</th>
                 <th data-sort="category">Категория</th>
                 <th data-sort="dims">Размеры (мм)</th>
                 <th data-sort="price_unit_ex_vat">Цена/ед</th>
@@ -207,6 +205,7 @@
       <button id="close-compare" class="close">×</button>
       <h3>Сравнение позиций</h3>
       <div id="compare-table" class="compare-table"></div>
+      <div id="compare-summary" class="compare-summary"></div>
     </div>
   </div>
 
@@ -257,45 +256,38 @@
     </div>
   </div>
 
-  <aside id="cart-drawer" class="cart-drawer">
-    <div class="cart-header">
-      <h3>Корзина</h3>
-      <button id="close-cart" class="close">×</button>
-    </div>
-    <div id="cart-items" class="cart-items"></div>
-    <div class="cart-summary">
-      <div>Позиций: <strong id="cart-total-items">0</strong></div>
-      <div>Сумма: <strong id="cart-total-price">0</strong></div>
-      <div>Средняя цена/м²: <strong id="cart-avg-price">0</strong></div>
-      <div>Объём: <strong id="cart-total-volume">0</strong></div>
-      <button id="cart-export-btn" class="primary">Экспорт сметы в Excel</button>
-    </div>
-  </aside>
-
   <script src="vendor/xlsx.full.min.js"></script>
   <script src="vendor/flexsearch.bundle.min.js"></script>
   <script id="worker-src" type="text/plain">
     self.importScripts('vendor/xlsx.full.min.js');
 
     const CATEGORY_STEMS = {
-      "шкаф": ["шкаф", "пенал", "гардероб", "купе"],
-      "стеллаж": ["стеллаж", "стелаж", "стелл"],
-      "кухня": ["кухн"],
-      "стол": ["стол", "столешн", "столик"],
-      "бенч-стол": ["бенч", "bench", "бенч-стол"],
-      "бар": ["бар", "барн", "стойк"],
-      "дверь": ["двер", "дверн"],
-      "перила": ["перил", "поручн"],
-      "зеркало": ["зеркал"],
+      "Шкафы": ["шкаф", "пенал", "гардероб", "купе", "встроен"],
+      "Стеллажи": ["стеллаж", "стелл", "этажерк"],
+      "Кухни": ["кухн", "столешниц", "фартук"],
+      "Столы": ["стол", "столик", "парт"],
+      "Кресла и стулья": ["кресл", "стул", "табурет", "пуф"],
+      "Бары и стойки": ["бар", "стойк", "ресепшн"],
+      "Двери": ["двер", "дверн", "полотн"],
+      "Перегородки": ["перегород", "перил", "поручн"],
+      "Зеркала": ["зеркал"],
+      "Освещение": ["светильн", "люстр", "бра", "торшер", "подсветк"],
+      "Мягкая мебель": ["диван", "кровать", "матрас"],
+      "Офисная мебель": ["офисн", "рабоч.*мест", "кабинет"],
+      "Детская мебель": ["детск", "подростк"],
+      "Фурнитура": ["ручк", "петл", "направляющ", "фурнитур"],
+      "Прочее": [],
     };
 
     const FLAG_TOKENS = {
-      has_led: ["подсвет", "подсветка", "led", "лента", "светодиод"],
-      mat_ldsp: ["лдсп", "egger", "ламинирован", "ламинир"],
-      mat_mdf: ["мдф", "mdf"],
-      mat_veneer: ["шпон", "veneer"],
-      has_glass: ["стекл", "зеркал"],
-      has_metal: ["металл", "сталь", "нерж", "нержав", "inox", "алюм", "порошк"],
+      mat_ldsp: ["лдсп", "egger", "эггер", "ламинирован"],
+      mat_mdf: ["мдф", "mdf", "крашен"],
+      mat_veneer: ["шпон", "veneer", "натуральн.*дерев", "массив"],
+      has_glass: ["стекл", "зеркал", "витраж"],
+      has_metal: ["металл", "сталь", "нерж", "нержавею", "алюм", "порошк", "хром"],
+      has_led: ["подсвет", "led", "лента", "светодиод"],
+      has_stone: ["камень", "кварц", "мрамор", "гранит"],
+      has_acrylic: ["акрил", "пмма", "оргстекл"],
     };
 
     const NAME_KEYWORDS = [
@@ -330,7 +322,7 @@
       "порошк",
     ];
 
-    const HEADER_SCAN_ROWS = 120;
+    const HEADER_SCAN_ROWS = 100;
     let idCounter = 1;
 
     function normalizeHeaderText(value) {
@@ -363,6 +355,43 @@
       return null;
     }
 
+    function detectTableStart(rows, maxScan = 100) {
+      const scanLimit = Math.min(rows.length, maxScan);
+      for (let i = 0; i < scanLimit; i += 1) {
+        const row = rows[i] || [];
+        const rowText = row.map((cell) => String(cell || "").toLowerCase()).join(" ");
+        if (/(коммерческое предложение|\bкп\b|логотип)/i.test(rowText)) continue;
+        const filledCount = row.filter((cell) => cell !== null && cell !== undefined && String(cell).trim()).length;
+        if (filledCount < 3) continue;
+        const hasKeywords = /(наименован|назван|артикул|цен|размер|материал|кол.*во|ед.*изм)/i.test(rowText);
+        if (hasKeywords) return i;
+      }
+      return null;
+    }
+
+    function analyzeColumnContent(values) {
+      const samples = values.filter((v) => v != null).slice(0, 20);
+      if (!samples.length) return { type: null, confidence: 0 };
+
+      let dimMatches = 0;
+      let priceMatches = 0;
+      let nameMatches = 0;
+
+      samples.forEach((val) => {
+        const str = String(val).toLowerCase();
+        if (/\d{2,4}\s*[x×*]\s*\d{2,4}/.test(str)) dimMatches += 1;
+        if (/^\d{1,8}([.,]\d{1,2})?$/.test(str) && parseFloat(str) > 100) priceMatches += 1;
+        if (str.length > 10 && /[а-я]{3,}/.test(str)) nameMatches += 1;
+      });
+
+      const total = samples.length;
+      if (dimMatches / total > 0.5) return { type: "dims", confidence: dimMatches / total };
+      if (priceMatches / total > 0.6) return { type: "price", confidence: priceMatches / total };
+      if (nameMatches / total > 0.7) return { type: "name", confidence: nameMatches / total };
+
+      return { type: null, confidence: 0 };
+    }
+
     function detectHeaderRow(rows) {
       let best = { idx: null, score: 0 };
       for (let rowIdx = 0; rowIdx < rows.length; rowIdx += 1) {
@@ -371,14 +400,15 @@
         if (!values.length) continue;
         const normalized = row.map(normalizeHeaderText);
         if (!normalized.some((text) => text && text !== "nan")) continue;
-        const { mapping } = detectSheetMapping(row);
+        const sampleRows = rows.slice(rowIdx + 1, rowIdx + 21);
+        const { mapping } = detectSheetMapping(row, sampleRows);
         const score = Object.values(mapping).filter((value) => value !== null).length;
         if (score > best.score) best = { idx: rowIdx, score };
       }
       return best.score >= 1 ? best.idx : null;
     }
 
-    function detectSheetMapping(headerRow) {
+    function detectSheetMapping(headerRow, sampleRows = []) {
       const mapping = {
         name_col: null,
         dims_col: null,
@@ -400,6 +430,31 @@
         const key = `${canonical}_col`;
         if (mapping[key] === null) mapping[key] = idx;
       });
+
+      if (sampleRows.length) {
+        const maxCols = Math.max(
+          headerRow.length,
+          ...sampleRows.map((row) => (row ? row.length : 0)),
+        );
+        const usedCols = new Set(Object.values(mapping).filter((value) => value !== null));
+        for (let colIdx = 0; colIdx < maxCols; colIdx += 1) {
+          if (usedCols.has(colIdx)) continue;
+          const values = sampleRows.map((row) => (row ? row[colIdx] : null));
+          const analysis = analyzeColumnContent(values);
+          if (analysis.type === "dims" && mapping.dims_col === null) {
+            mapping.dims_col = colIdx;
+            usedCols.add(colIdx);
+          }
+          if (analysis.type === "price" && mapping.price_unit_col === null) {
+            mapping.price_unit_col = colIdx;
+            usedCols.add(colIdx);
+          }
+          if (analysis.type === "name" && mapping.name_col === null) {
+            mapping.name_col = colIdx;
+            usedCols.add(colIdx);
+          }
+        }
+      }
       const matches = Object.values(mapping).filter((value) => value !== null).length;
       const confidence = matches ? Math.min(matches / 5, 1) : 0.0;
       return { mapping, confidence, stats };
@@ -427,7 +482,7 @@
       return mapping;
     }
 
-    function getMappingForSheet(sheetName, headerRowValues, customMappings) {
+    function getMappingForSheet(sheetName, headerRowValues, sampleRows, customMappings) {
       const customSheet = customMappings?.sheets?.[sheetName];
       if (customSheet) {
         return { mapping: normalizeMapping(customSheet), source: "manual", confidence: 1 };
@@ -435,7 +490,7 @@
       if (customMappings?.global) {
         return { mapping: normalizeMapping(customMappings.global), source: "manual-global", confidence: 1 };
       }
-      const detected = detectSheetMapping(headerRowValues || []);
+      const detected = detectSheetMapping(headerRowValues || [], sampleRows || []);
       return { mapping: detected.mapping, source: "auto", confidence: detected.confidence };
     }
 
@@ -518,14 +573,19 @@
     }
 
     function extractCategory(text) {
-      const tokens = tokenize(text);
-      let bestCategory = null;
+      const tokens = text.toLowerCase().match(/[а-яa-z0-9]+/gi) || [];
+      let bestCategory = "Прочее";
       let bestScore = 0;
+
       for (const [category, stems] of Object.entries(CATEGORY_STEMS)) {
+        if (category === "Прочее") continue;
         let score = 0;
         for (const token of tokens) {
           for (const stem of stems) {
-            if (token.startsWith(stem)) score += stem.length;
+            const regex = new RegExp(`^${stem}`, "i");
+            if (regex.test(token)) {
+              score += stem.length;
+            }
           }
         }
         if (score > bestScore) {
@@ -533,7 +593,22 @@
           bestScore = score;
         }
       }
+
       return bestCategory;
+    }
+
+    function detectFlags(name, description, materials) {
+      const text = `${name || ""} ${description || ""} ${materials || ""}`.toLowerCase();
+      const flags = {};
+
+      Object.entries(FLAG_TOKENS).forEach(([flag, tokens]) => {
+        flags[flag] = tokens.some((token) => {
+          const regex = new RegExp(token, "i");
+          return regex.test(text);
+        });
+      });
+
+      return flags;
     }
 
     function parseRow(row, mapping, sheetName, sourceRow) {
@@ -565,11 +640,7 @@
       const pricePerLm = widthM ? priceUnitExVat / widthM : null;
       const pricePerM2 = widthM && heightM ? priceUnitExVat / (widthM * heightM) : null;
 
-      const flagsText = normalizeForFlags(`${name || ""} ${description || ""}`);
-      const flags = {};
-      Object.entries(FLAG_TOKENS).forEach(([flag, tokens]) => {
-        flags[flag] = tokens.some((token) => flagsText.includes(token)) ? 1 : 0;
-      });
+      const flags = detectFlags(name, description, mapping.desc_col !== null ? row[mapping.desc_col] : null);
 
       const item = {
         id: idCounter++,
@@ -585,12 +656,14 @@
         price_total_ex_vat: priceTotalExVat,
         price_per_lm: pricePerLm,
         price_per_m2: pricePerM2,
-        has_led: flags.has_led,
-        mat_ldsp: flags.mat_ldsp,
-        mat_mdf: flags.mat_mdf,
-        mat_veneer: flags.mat_veneer,
-        has_glass: flags.has_glass,
-        has_metal: flags.has_metal,
+        has_led: flags.has_led ? 1 : 0,
+        mat_ldsp: flags.mat_ldsp ? 1 : 0,
+        mat_mdf: flags.mat_mdf ? 1 : 0,
+        mat_veneer: flags.mat_veneer ? 1 : 0,
+        has_glass: flags.has_glass ? 1 : 0,
+        has_metal: flags.has_metal ? 1 : 0,
+        has_stone: flags.has_stone ? 1 : 0,
+        has_acrylic: flags.has_acrylic ? 1 : 0,
         category: extractCategory(normalizeText(`${name} ${description || ""}`)),
         raw: {
           name: rawName,
@@ -700,7 +773,10 @@
           blankrows: false,
           raw: true,
         });
-        let headerRowIdx = detectHeaderRow(previewRows);
+        let headerRowIdx = detectTableStart(previewRows, HEADER_SCAN_ROWS);
+        if (headerRowIdx === null) {
+          headerRowIdx = detectHeaderRow(previewRows);
+        }
         let mapping = null;
         let headerRow = null;
         let rowsTotal = 0;
@@ -711,7 +787,8 @@
         let mappingSource = "auto";
 
         let headerRowValues = headerRowIdx !== null ? previewRows[headerRowIdx] || [] : [];
-        const mappingResult = getMappingForSheet(sheetName, headerRowValues, customMappings);
+        const sampleRows = headerRowIdx !== null ? previewRows.slice(headerRowIdx + 1, headerRowIdx + 21) : previewRows.slice(0, 20);
+        const mappingResult = getMappingForSheet(sheetName, headerRowValues, sampleRows, customMappings);
         mapping = mappingResult.mapping;
         confidence = mappingResult.confidence;
         mappingSource = mappingResult.source;
