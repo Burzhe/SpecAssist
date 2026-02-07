@@ -31,7 +31,12 @@
     lastResults: [],
     sortKey: "price_unit_ex_vat",
     sortDir: "asc",
+    viewMode: "table",
+    compareIds: new Set(),
+    cartItems: [],
     worker: null,
+    searchTimer: null,
+    filterTimer: null,
     progress: {
       sheetsTotal: 0,
       sheetsDone: 0,
@@ -55,6 +60,7 @@
     progressContainer: document.getElementById("progress-container"),
     overallProgress: document.getElementById("overall-progress"),
     overallProgressLabel: document.getElementById("overall-progress-label"),
+    progressMessage: document.getElementById("progress-message"),
     sheetProgress: document.getElementById("sheet-progress"),
     progressStats: document.getElementById("progress-stats"),
     searchInput: document.getElementById("search-input"),
@@ -63,10 +69,40 @@
     flagFilters: document.getElementById("flag-filters"),
     resultsTableBody: document.querySelector("#results-table tbody"),
     resultsSummary: document.getElementById("results-summary"),
+    resultsEmpty: document.getElementById("results-empty"),
+    resultsLoading: document.getElementById("results-loading"),
+    cardsView: document.getElementById("cards-view"),
+    tableWrap: document.getElementById("table-wrap"),
     detailsDrawer: document.getElementById("details-drawer"),
     detailsContent: document.getElementById("details-content"),
     closeDrawer: document.getElementById("close-drawer"),
     resetBtn: document.getElementById("reset-btn"),
+    resetFiltersBtn: document.getElementById("reset-filters-btn"),
+    activeFilters: document.getElementById("active-filters"),
+    categoryCount: document.getElementById("category-count"),
+    viewTableBtn: document.getElementById("view-table-btn"),
+    viewCardsBtn: document.getElementById("view-cards-btn"),
+    exportBtn: document.getElementById("export-btn"),
+    increaseTolBtn: document.getElementById("increase-tol-btn"),
+    removeLedBtn: document.getElementById("remove-led-btn"),
+    sheetPreview: document.getElementById("sheet-preview"),
+    sheetPreviewTabs: document.getElementById("sheet-preview-tabs"),
+    sheetPreviewContent: document.getElementById("sheet-preview-content"),
+    compareBtn: document.getElementById("compare-btn"),
+    compareModal: document.getElementById("compare-modal"),
+    compareTable: document.getElementById("compare-table"),
+    closeCompare: document.getElementById("close-compare"),
+    themeToggle: document.getElementById("theme-toggle"),
+    cartBtn: document.getElementById("cart-btn"),
+    cartCount: document.getElementById("cart-count"),
+    cartDrawer: document.getElementById("cart-drawer"),
+    closeCart: document.getElementById("close-cart"),
+    cartItems: document.getElementById("cart-items"),
+    cartTotalItems: document.getElementById("cart-total-items"),
+    cartTotalPrice: document.getElementById("cart-total-price"),
+    cartAvgPrice: document.getElementById("cart-avg-price"),
+    cartTotalVolume: document.getElementById("cart-total-volume"),
+    cartExportBtn: document.getElementById("cart-export-btn"),
   };
 
   const dimInputs = {
@@ -79,6 +115,12 @@
     hMin: document.getElementById("h-min"),
     hMax: document.getElementById("h-max"),
     hTol: document.getElementById("h-tol"),
+    wMinRange: document.getElementById("w-min-range"),
+    wMaxRange: document.getElementById("w-max-range"),
+    dMinRange: document.getElementById("d-min-range"),
+    dMaxRange: document.getElementById("d-max-range"),
+    hMinRange: document.getElementById("h-min-range"),
+    hMaxRange: document.getElementById("h-max-range"),
   };
 
   const priceInputs = {
@@ -180,6 +222,33 @@
     return Number(value).toLocaleString("ru-RU", { maximumFractionDigits: digits });
   }
 
+  function debounce(fn, delay) {
+    let timer;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), delay);
+    };
+  }
+
+  function throttle(fn, delay) {
+    let lastCall = 0;
+    let timeoutId;
+    return (...args) => {
+      const now = Date.now();
+      const remaining = delay - (now - lastCall);
+      if (remaining <= 0) {
+        lastCall = now;
+        fn(...args);
+      } else {
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => {
+          lastCall = Date.now();
+          fn(...args);
+        }, remaining);
+      }
+    };
+  }
+
   function showScreen(screen) {
     elements.uploadScreen.classList.toggle("active", screen === "upload");
     elements.searchScreen.classList.toggle("active", screen === "search");
@@ -191,7 +260,7 @@
       const wrapper = document.createElement("div");
       wrapper.className = "flag-item";
       wrapper.innerHTML = `
-        <span>${label}</span>
+        <span>${label} <span class="pill-count" data-flag-count="${key}"></span></span>
         <select data-flag="${key}">
           <option value="">Любой</option>
           <option value="yes">Должен быть</option>
@@ -215,6 +284,58 @@
       });
   }
 
+  function updateFilterCounts(items) {
+    const categoryCounts = items.reduce((acc, item) => {
+      if (!item.category) return acc;
+      acc[item.category] = (acc[item.category] || 0) + 1;
+      return acc;
+    }, {});
+    const selectedCategory = elements.categoryFilter.value;
+    const categoryLabel = selectedCategory ? `${selectedCategory} (${categoryCounts[selectedCategory] || 0})` : `Всего (${items.length})`;
+    elements.categoryCount.textContent = categoryLabel;
+
+    Object.keys(FLAG_LABELS).forEach((flag) => {
+      const count = items.filter((item) => item[flag]).length;
+      const badge = elements.flagFilters.querySelector(`[data-flag-count="${flag}"]`);
+      if (badge) badge.textContent = count ? `(${count})` : "";
+    });
+  }
+
+  function syncRangePair(minRange, maxRange, minInput, maxInput) {
+    const minValue = Number(minRange.value);
+    const maxValue = Number(maxRange.value);
+    if (minValue > maxValue) {
+      minRange.value = maxValue;
+    }
+    minInput.value = minRange.value !== "0" ? minRange.value : "";
+    maxInput.value = maxRange.value !== maxRange.max ? maxRange.value : "";
+  }
+
+  function setRangeFromInput(input, range, fallbackValue) {
+    const value = parseFloat(input.value);
+    if (Number.isFinite(value)) {
+      range.value = Math.min(Math.max(value, Number(range.min)), Number(range.max));
+    } else {
+      range.value = fallbackValue;
+    }
+  }
+
+  function updateActiveFilters(filters) {
+    let count = 0;
+    if (filters.query) count += 1;
+    if (filters.category) count += 1;
+    count += Object.keys(filters.flags).length;
+    ["w", "d", "h"].forEach((key) => {
+      const dim = filters.dims[key];
+      if (Number.isFinite(dim.min) || Number.isFinite(dim.max)) count += 1;
+      if (Number.isFinite(dim.tol) && dim.tol > 0) count += 1;
+    });
+    if (Number.isFinite(filters.price.min) || Number.isFinite(filters.price.max)) count += 1;
+
+    elements.activeFilters.textContent = count ? `Применено фильтров: ${count}` : "Фильтры не применены";
+    elements.resetFiltersBtn.classList.toggle("hidden", count === 0);
+  }
+
   function getSelectedSheets() {
     const selected = [];
     elements.sheetList.querySelectorAll("input[type='checkbox']").forEach((checkbox) => {
@@ -235,6 +356,7 @@
     elements.progressStats.textContent = "";
     elements.overallProgress.value = 0;
     elements.overallProgressLabel.textContent = "0%";
+    elements.progressMessage.textContent = "";
   }
 
   function updateProgressUI(payload) {
@@ -248,6 +370,9 @@
     const progressPercent = Math.round((state.progress.sheetsDone / sheetsTotal) * 100);
     elements.overallProgress.value = progressPercent;
     elements.overallProgressLabel.textContent = `${progressPercent}%`;
+    if (progressPercent < 30) elements.progressMessage.textContent = "🔍 Сканируем листы...";
+    else if (progressPercent < 80) elements.progressMessage.textContent = "📊 Индексируем данные...";
+    else elements.progressMessage.textContent = "✨ Готово!";
 
     const row = document.createElement("div");
     row.className = "progress-row";
@@ -347,24 +472,116 @@
 
   function renderResults(items) {
     state.lastResults = items;
-    elements.resultsTableBody.innerHTML = "";
     elements.resultsSummary.textContent = `Найдено: ${items.length}`;
-    items.forEach((item) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${item.name || ""}</td>
-        <td>${item.category || "—"}</td>
-        <td>${[item.w_mm, item.d_mm, item.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ")}</td>
-        <td>${formatNumber(item.price_unit_ex_vat)}</td>
-        <td>${formatNumber(item.price_per_lm)}</td>
-        <td>${formatNumber(item.price_per_m2)}</td>
-        <td>${renderFlagPills(item)}</td>
-        <td>${item.source_sheet || ""}</td>
-        <td>${item.source_row || ""}</td>
-      `;
-      tr.addEventListener("click", () => showDetails(item));
-      elements.resultsTableBody.appendChild(tr);
-    });
+    elements.resultsEmpty.classList.toggle("hidden", items.length > 0);
+
+    const renderTableSlice = (start, end) => {
+      elements.resultsTableBody.innerHTML = "";
+      const fragment = document.createDocumentFragment();
+      const total = items.length;
+      const topSpacer = document.createElement("tr");
+      topSpacer.className = "spacer-row";
+      topSpacer.innerHTML = `<td colspan="10" style="height:${start * 44}px"></td>`;
+      fragment.appendChild(topSpacer);
+      items.slice(start, end).forEach((item) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><input type="checkbox" data-compare="${item.id}" ${state.compareIds.has(item.id) ? "checked" : ""} /></td>
+          <td>${item.name || ""}</td>
+          <td>${item.category || "—"}</td>
+          <td>${[item.w_mm, item.d_mm, item.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ")}</td>
+          <td>${formatNumber(item.price_unit_ex_vat)}</td>
+          <td>${formatNumber(item.price_per_lm)}</td>
+          <td>${formatNumber(item.price_per_m2)}</td>
+          <td>${renderFlagPills(item)}</td>
+          <td>${item.source_sheet || ""}</td>
+          <td>${item.source_row || ""}</td>
+        `;
+        tr.addEventListener("click", (event) => {
+          if (event.target.matches("input[type='checkbox']")) return;
+          showDetails(item);
+        });
+        fragment.appendChild(tr);
+      });
+      const bottomSpacer = document.createElement("tr");
+      bottomSpacer.className = "spacer-row";
+      bottomSpacer.innerHTML = `<td colspan="10" style="height:${Math.max(total - end, 0) * 44}px"></td>`;
+      fragment.appendChild(bottomSpacer);
+      elements.resultsTableBody.appendChild(fragment);
+      elements.resultsTableBody.querySelectorAll("input[data-compare]").forEach((checkbox) => {
+        checkbox.addEventListener("change", (event) => {
+          const id = Number(event.target.dataset.compare);
+          if (event.target.checked) state.compareIds.add(id);
+          else state.compareIds.delete(id);
+          updateCompareButton();
+        });
+      });
+    };
+
+    const renderCardsSlice = (start, end) => {
+      elements.cardsView.innerHTML = "";
+      elements.cardsView.style.paddingTop = `${start * 220}px`;
+      elements.cardsView.style.paddingBottom = `${Math.max(items.length - end, 0) * 220}px`;
+      const fragment = document.createDocumentFragment();
+      items.slice(start, end).forEach((item) => {
+        const card = document.createElement("div");
+        card.className = "card-item";
+        card.innerHTML = `
+          <div class="cards-actions">
+            <strong>${item.name || "Без названия"}</strong>
+            <label><input type="checkbox" data-compare="${item.id}" ${state.compareIds.has(item.id) ? "checked" : ""} /> сравнить</label>
+          </div>
+          <div class="dims-icon">📦 ${[item.w_mm, item.d_mm, item.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ")}</div>
+          <div>Цена/ед: <strong>${formatNumber(item.price_unit_ex_vat)}</strong></div>
+          <div class="card-badges">${renderBadgeChips(item) || ""}</div>
+          <div class="cards-actions">
+            <button class="ghost" data-details="${item.id}">Подробнее</button>
+            <button class="ghost" data-cart="${item.id}">В корзину</button>
+          </div>
+        `;
+        fragment.appendChild(card);
+      });
+      elements.cardsView.appendChild(fragment);
+      elements.cardsView.querySelectorAll("button[data-details]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const item = items.find((entry) => entry.id === Number(btn.dataset.details));
+          if (item) showDetails(item);
+        });
+      });
+      elements.cardsView.querySelectorAll("button[data-cart]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const item = items.find((entry) => entry.id === Number(btn.dataset.cart));
+          if (item) addToCart(item);
+        });
+      });
+      elements.cardsView.querySelectorAll("input[data-compare]").forEach((checkbox) => {
+        checkbox.addEventListener("change", (event) => {
+          const id = Number(event.target.dataset.compare);
+          if (event.target.checked) state.compareIds.add(id);
+          else state.compareIds.delete(id);
+          updateCompareButton();
+        });
+      });
+    };
+
+    const renderWithVirtualization = () => {
+      if (state.viewMode === "table") {
+        const rowHeight = 44;
+        const visibleCount = Math.ceil(elements.tableWrap.clientHeight / rowHeight) + 10;
+        const startIndex = Math.max(Math.floor(elements.tableWrap.scrollTop / rowHeight) - 5, 0);
+        renderTableSlice(startIndex, startIndex + visibleCount);
+      } else {
+        const cardHeight = 220;
+        const visibleCount = Math.ceil(elements.cardsView.clientHeight / cardHeight) + 6;
+        const startIndex = Math.max(Math.floor(elements.cardsView.scrollTop / cardHeight) - 3, 0);
+        renderCardsSlice(startIndex, startIndex + visibleCount);
+      }
+    };
+
+    renderWithVirtualization();
+    elements.tableWrap.onscroll = renderWithVirtualization;
+    elements.cardsView.onscroll = renderWithVirtualization;
+    updateCompareButton();
   }
 
   function renderFlagPills(item) {
@@ -372,6 +589,162 @@
       .filter((flag) => item[flag])
       .map((flag) => `<span class="flag-pill">${FLAG_LABELS[flag]}</span>`)
       .join("");
+  }
+
+  function renderBadgeChips(item) {
+    return Object.keys(FLAG_LABELS)
+      .filter((flag) => item[flag])
+      .map((flag) => `<span class="badge-chip">${FLAG_LABELS[flag]}</span>`)
+      .join("");
+  }
+
+  function updateCompareButton() {
+    const count = state.compareIds.size;
+    elements.compareBtn.textContent = `Сравнить (${count})`;
+    elements.compareBtn.classList.toggle("hidden", count === 0);
+  }
+
+  function renderCompareModal() {
+    const compareItems = state.items.filter((item) => state.compareIds.has(item.id));
+    if (!compareItems.length) return;
+    const prices = compareItems.map((item) => item.price_unit_ex_vat).filter(Number.isFinite);
+    const minPrice = prices.length ? Math.min(...prices) : null;
+    const maxPrice = prices.length ? Math.max(...prices) : null;
+
+    const rows = [
+      { label: "Название", key: "name" },
+      { label: "Категория", key: "category" },
+      { label: "Размеры", key: "dims" },
+      { label: "Цена/ед", key: "price_unit_ex_vat", highlight: true },
+      { label: "Цена/м²", key: "price_per_m2" },
+      { label: "Флаги", key: "flags" },
+    ];
+
+    elements.compareTable.innerHTML = "";
+    rows.forEach((row) => {
+      const rowEl = document.createElement("div");
+      rowEl.className = "compare-row";
+      const label = document.createElement("strong");
+      label.textContent = row.label;
+      rowEl.appendChild(label);
+      compareItems.forEach((item) => {
+        const cell = document.createElement("div");
+        if (row.key === "dims") {
+          cell.textContent = [item.w_mm, item.d_mm, item.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ");
+        } else if (row.key === "flags") {
+          cell.innerHTML = renderFlagPills(item) || "—";
+        } else if (row.key === "price_unit_ex_vat") {
+          const price = item.price_unit_ex_vat;
+          cell.textContent = formatNumber(price);
+          if (row.highlight && Number.isFinite(price) && minPrice !== null && maxPrice !== null) {
+            if (price === minPrice) cell.classList.add("highlight-best");
+            if (price === maxPrice) cell.classList.add("highlight-worst");
+          }
+        } else if (row.key === "price_per_m2") {
+          cell.textContent = formatNumber(item.price_per_m2);
+        } else {
+          cell.textContent = item[row.key] || "—";
+        }
+        rowEl.appendChild(cell);
+      });
+      elements.compareTable.appendChild(rowEl);
+    });
+    elements.compareModal.classList.remove("hidden");
+  }
+
+  function addToCart(item) {
+    if (!state.cartItems.find((entry) => entry.id === item.id)) {
+      state.cartItems.push(item);
+      updateCartUI();
+    }
+    elements.cartDrawer.classList.add("open");
+  }
+
+  function removeFromCart(id) {
+    state.cartItems = state.cartItems.filter((item) => item.id !== id);
+    updateCartUI();
+  }
+
+  function updateCartUI() {
+    elements.cartItems.innerHTML = "";
+    let totalPrice = 0;
+    let totalAreaPrice = 0;
+    let areaCount = 0;
+    let totalVolume = 0;
+
+    state.cartItems.forEach((item) => {
+      const card = document.createElement("div");
+      card.className = "cart-item";
+      card.innerHTML = `
+        <strong>${item.name || "Без названия"}</strong>
+        <span>Цена/ед: ${formatNumber(item.price_unit_ex_vat)}</span>
+        <span>Размеры: ${[item.w_mm, item.d_mm, item.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ")}</span>
+        <button class="ghost" data-remove="${item.id}">Удалить</button>
+      `;
+      elements.cartItems.appendChild(card);
+      if (Number.isFinite(item.price_unit_ex_vat)) totalPrice += item.price_unit_ex_vat;
+      if (Number.isFinite(item.price_per_m2)) {
+        totalAreaPrice += item.price_per_m2;
+        areaCount += 1;
+      }
+      if (item.w_mm && item.d_mm && item.h_mm) {
+        totalVolume += (item.w_mm / 1000) * (item.d_mm / 1000) * (item.h_mm / 1000);
+      }
+    });
+
+    elements.cartItems.querySelectorAll("button[data-remove]").forEach((btn) => {
+      btn.addEventListener("click", () => removeFromCart(Number(btn.dataset.remove)));
+    });
+
+    elements.cartCount.textContent = state.cartItems.length;
+    elements.cartTotalItems.textContent = state.cartItems.length;
+    elements.cartTotalPrice.textContent = formatNumber(totalPrice);
+    elements.cartAvgPrice.textContent = areaCount ? formatNumber(totalAreaPrice / areaCount) : "—";
+    elements.cartTotalVolume.textContent = totalVolume ? `${totalVolume.toFixed(2)} м³` : "—";
+  }
+
+  function exportItemsToExcel(items, filename) {
+    const rows = items.map((item) => ({
+      name: item.name,
+      category: item.category,
+      w_mm: item.w_mm,
+      d_mm: item.d_mm,
+      h_mm: item.h_mm,
+      price_unit_ex_vat: item.price_unit_ex_vat,
+      price_per_lm: item.price_per_lm,
+      price_per_m2: item.price_per_m2,
+      flags: Object.keys(FLAG_LABELS)
+        .filter((flag) => item[flag])
+        .map((flag) => FLAG_LABELS[flag])
+        .join(", "),
+      source_sheet: item.source_sheet,
+      source_row: item.source_row,
+    }));
+    const sheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, sheet, "results");
+    XLSX.writeFile(workbook, filename);
+  }
+
+  function setViewMode(mode) {
+    state.viewMode = mode;
+    elements.viewTableBtn.classList.toggle("active", mode === "table");
+    elements.viewCardsBtn.classList.toggle("active", mode === "cards");
+    elements.tableWrap.classList.toggle("hidden", mode !== "table");
+    elements.cardsView.classList.toggle("hidden", mode !== "cards");
+    renderResults(state.lastResults);
+  }
+
+  function triggerConfetti() {
+    const confetti = document.createElement("div");
+    confetti.textContent = "🎉";
+    confetti.style.position = "fixed";
+    confetti.style.top = "20px";
+    confetti.style.right = "20px";
+    confetti.style.fontSize = "32px";
+    confetti.style.zIndex = "40";
+    document.body.appendChild(confetti);
+    setTimeout(() => confetti.remove(), 1200);
   }
 
   function normalizeText(text) {
@@ -439,10 +812,15 @@
 
   function showDetails(item) {
     const similar = findSimilar(item);
+    const compareBtnLabel = state.compareIds.has(item.id) ? "Убрать из сравнения" : "Добавить в сравнение";
     elements.detailsContent.innerHTML = `
       <div class="details-section">
         <h3>${item.name || ""}</h3>
         <p>${item.description || ""}</p>
+        <div class="details-actions">
+          <button id="details-compare-btn" class="ghost">${compareBtnLabel}</button>
+          <button id="details-cart-btn" class="ghost">Добавить в корзину</button>
+        </div>
       </div>
       <div class="details-section">
         <strong>Параметры</strong>
@@ -459,26 +837,51 @@
         <div>${renderFlagPills(item) || "—"}</div>
       </div>
       <div class="details-section">
+        <strong>Сравнение цен</strong>
+        <canvas id="price-chart" width="320" height="160"></canvas>
+      </div>
+      <div class="details-section">
         <strong>Raw</strong>
         <pre>${JSON.stringify(item.raw || {}, null, 2)}</pre>
       </div>
       <div class="details-section">
         <strong>Похожие позиции</strong>
-        <ul class="similar-list">
+        <div class="similar-cards">
           ${similar
             .map(
               (sim) => `
-              <li>
-                <div><strong>${sim.name || ""}</strong></div>
+              <div class="card-item">
+                <strong>${sim.name || ""}</strong>
                 <div>${[sim.w_mm, sim.d_mm, sim.h_mm].map((v) => (v ? Math.round(v) : "—")).join(" × ")}</div>
                 <div>Цена/ед: ${formatNumber(sim.price_unit_ex_vat)}</div>
-              </li>
+                <button class="ghost" data-details="${sim.id}">Подробнее</button>
+              </div>
             `,
             )
             .join("")}
-        </ul>
+        </div>
       </div>
     `;
+    elements.detailsContent.querySelectorAll("button[data-details]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const target = state.items.find((entry) => entry.id === Number(btn.dataset.details));
+        if (target) showDetails(target);
+      });
+    });
+    const compareBtn = elements.detailsContent.querySelector("#details-compare-btn");
+    if (compareBtn) {
+      compareBtn.addEventListener("click", () => {
+        if (state.compareIds.has(item.id)) state.compareIds.delete(item.id);
+        else state.compareIds.add(item.id);
+        updateCompareButton();
+        showDetails(item);
+      });
+    }
+    const cartBtn = elements.detailsContent.querySelector("#details-cart-btn");
+    if (cartBtn) {
+      cartBtn.addEventListener("click", () => addToCart(item));
+    }
+    renderPriceChart(item, similar);
     elements.detailsDrawer.classList.add("open");
   }
 
@@ -486,17 +889,43 @@
     elements.detailsDrawer.classList.remove("open");
   }
 
+  function renderPriceChart(item, similar) {
+    const canvas = elements.detailsContent.querySelector("#price-chart");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const data = [item, ...similar.slice(0, 4)];
+    const prices = data.map((entry) => entry.price_unit_ex_vat || 0);
+    const maxPrice = Math.max(...prices, 1);
+    const barWidth = 40;
+    const gap = 16;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    data.forEach((entry, idx) => {
+      const barHeight = (entry.price_unit_ex_vat || 0) / maxPrice * 120;
+      const x = 20 + idx * (barWidth + gap);
+      const y = 140 - barHeight;
+      ctx.fillStyle = idx === 0 ? "#2f5ef6" : "#9aa6c3";
+      ctx.fillRect(x, y, barWidth, barHeight);
+      ctx.fillStyle = "#5f6b85";
+      ctx.font = "10px sans-serif";
+      ctx.fillText(`№${idx + 1}`, x + 8, 155);
+    });
+  }
+
   async function handleSearch() {
+    elements.resultsLoading.classList.remove("hidden");
     const filters = getFilterValues();
     let items = state.items;
     if (filters.query) {
-      const ids = state.index.search(filters.query.toLowerCase(), { limit: 5000 });
+      const ids = state.index ? state.index.search(filters.query.toLowerCase(), { limit: 5000 }) : [];
       const idSet = new Set(ids);
       items = items.filter((item) => idSet.has(item.id));
     }
+    updateFilterCounts(items);
     items = applyFilters(items, filters);
     items = sortResults(items);
     renderResults(items);
+    updateActiveFilters(filters);
+    elements.resultsLoading.classList.add("hidden");
   }
 
   function createWorker() {
@@ -529,6 +958,75 @@
     elements.importBtn.disabled = false;
   }
 
+  function classifyHeader(header) {
+    if (!header) return null;
+    const normalized = normalizeText(String(header));
+    if (/(наимен|назван|позици|item|product)/.test(normalized)) return "name";
+    if (/(цен|price|стоим)/.test(normalized)) return "price";
+    if (/(размер|width|height|depth|шир|выс|глуб|длина|w|h|d)/.test(normalized)) return "dims";
+    return null;
+  }
+
+  function renderSheetPreview(workbook, sheetNames) {
+    elements.sheetPreviewTabs.innerHTML = "";
+    elements.sheetPreviewContent.innerHTML = "";
+    if (!sheetNames.length) return;
+    elements.sheetPreview.classList.remove("hidden");
+
+    const createPreview = (name, isActive) => {
+      const tab = document.createElement("button");
+      tab.className = `ghost ${isActive ? "active" : ""}`;
+      tab.textContent = name;
+      tab.addEventListener("click", () => {
+        elements.sheetPreviewTabs.querySelectorAll("button").forEach((btn) => btn.classList.remove("active"));
+        tab.classList.add("active");
+        renderPreviewTable(name);
+      });
+      elements.sheetPreviewTabs.appendChild(tab);
+    };
+
+    const renderPreviewTable = (name) => {
+      const sheet = workbook.Sheets[name];
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 }).slice(0, 10);
+      if (!rows.length) {
+        elements.sheetPreviewContent.innerHTML = "<p>Нет данных для предпросмотра.</p>";
+        return;
+      }
+      const headers = rows[0];
+      const table = document.createElement("table");
+      table.className = "preview-table";
+      const thead = document.createElement("thead");
+      const headerRow = document.createElement("tr");
+      headers.forEach((header) => {
+        const th = document.createElement("th");
+        const type = classifyHeader(header);
+        if (type === "name") th.classList.add("col-name");
+        if (type === "price") th.classList.add("col-price");
+        if (type === "dims") th.classList.add("col-dims");
+        th.textContent = header || "—";
+        headerRow.appendChild(th);
+      });
+      thead.appendChild(headerRow);
+      table.appendChild(thead);
+      const tbody = document.createElement("tbody");
+      rows.slice(1).forEach((row) => {
+        const tr = document.createElement("tr");
+        headers.forEach((_, idx) => {
+          const td = document.createElement("td");
+          td.textContent = row[idx] ?? "";
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      elements.sheetPreviewContent.innerHTML = "";
+      elements.sheetPreviewContent.appendChild(table);
+    };
+
+    sheetNames.forEach((name, idx) => createPreview(name, idx === 0));
+    renderPreviewTable(sheetNames[0]);
+  }
+
   async function importWorkbook(file, sheetNames) {
     resetProgress();
     elements.progressContainer.classList.remove("hidden");
@@ -555,6 +1053,7 @@
         updateCategoryFilter();
         showScreen("search");
         await handleSearch();
+        triggerConfetti();
         worker.terminate();
       }
     };
@@ -607,6 +1106,9 @@
   }
 
   function setupEventListeners() {
+    const debouncedSearch = debounce(handleSearch, 300);
+    const throttledSearch = throttle(handleSearch, 200);
+
     elements.dropZone.addEventListener("dragover", (event) => {
       event.preventDefault();
       elements.dropZone.classList.add("dragover");
@@ -647,26 +1149,102 @@
     });
 
     elements.searchBtn.addEventListener("click", handleSearch);
+    elements.searchInput.addEventListener("input", debouncedSearch);
     elements.searchInput.addEventListener("keyup", (event) => {
       if (event.key === "Enter") handleSearch();
     });
 
-    Object.values(dimInputs).forEach((input) => input.addEventListener("change", handleSearch));
-    Object.values(priceInputs).forEach((input) => input.addEventListener("change", handleSearch));
+    Object.values(dimInputs).forEach((input) => {
+      input.addEventListener("change", throttledSearch);
+    });
+    Object.values(priceInputs).forEach((input) => input.addEventListener("change", throttledSearch));
     elements.categoryFilter.addEventListener("change", handleSearch);
     elements.flagFilters.addEventListener("change", handleSearch);
     elements.closeDrawer.addEventListener("click", hideDetails);
+    elements.viewTableBtn.addEventListener("click", () => setViewMode("table"));
+    elements.viewCardsBtn.addEventListener("click", () => setViewMode("cards"));
+    elements.exportBtn.addEventListener("click", () => exportItemsToExcel(state.lastResults, "specassist-results.xlsx"));
+    elements.increaseTolBtn.addEventListener("click", () => {
+      ["wTol", "dTol", "hTol"].forEach((key) => {
+        const current = parseFloat(dimInputs[key].value) || 0;
+        dimInputs[key].value = current + 50;
+      });
+      handleSearch();
+    });
+    elements.removeLedBtn.addEventListener("click", () => {
+      const ledSelect = elements.flagFilters.querySelector("select[data-flag='has_led']");
+      if (ledSelect) ledSelect.value = "";
+      handleSearch();
+    });
+    elements.resetFiltersBtn.addEventListener("click", () => {
+      elements.searchInput.value = "";
+      elements.categoryFilter.value = "";
+      elements.flagFilters.querySelectorAll("select[data-flag]").forEach((select) => (select.value = ""));
+      Object.values(priceInputs).forEach((input) => (input.value = ""));
+      Object.entries(dimInputs).forEach(([key, input]) => {
+        if (key.endsWith("Range")) return;
+        input.value = "";
+      });
+      dimInputs.wMinRange.value = 0;
+      dimInputs.wMaxRange.value = 6000;
+      dimInputs.dMinRange.value = 0;
+      dimInputs.dMaxRange.value = 6000;
+      dimInputs.hMinRange.value = 0;
+      dimInputs.hMaxRange.value = 6000;
+      handleSearch();
+    });
+    elements.compareBtn.addEventListener("click", renderCompareModal);
+    elements.closeCompare.addEventListener("click", () => elements.compareModal.classList.add("hidden"));
+    elements.compareModal.addEventListener("click", (event) => {
+      if (event.target === elements.compareModal) elements.compareModal.classList.add("hidden");
+    });
+    elements.themeToggle.addEventListener("click", () => {
+      document.body.classList.toggle("dark");
+      const isDark = document.body.classList.contains("dark");
+      elements.themeToggle.textContent = isDark ? "☀️ Светлая тема" : "🌙 Тёмная тема";
+    });
+    elements.cartBtn.addEventListener("click", () => elements.cartDrawer.classList.add("open"));
+    elements.closeCart.addEventListener("click", () => elements.cartDrawer.classList.remove("open"));
+    elements.cartExportBtn.addEventListener("click", () => exportItemsToExcel(state.cartItems, "specassist-cart.xlsx"));
 
     elements.resetBtn.addEventListener("click", async () => {
       await clearDB();
       state.items = [];
       state.index = null;
+      state.compareIds.clear();
+      state.cartItems = [];
       elements.fileInput.value = "";
       elements.sheetOptions.classList.add("hidden");
       elements.fileMeta.classList.add("hidden");
       elements.progressContainer.classList.add("hidden");
       resetProgress();
+      updateCartUI();
+      updateCompareButton();
       showScreen("upload");
+    });
+
+    const rangePairs = [
+      [dimInputs.wMinRange, dimInputs.wMaxRange, dimInputs.wMin, dimInputs.wMax],
+      [dimInputs.dMinRange, dimInputs.dMaxRange, dimInputs.dMin, dimInputs.dMax],
+      [dimInputs.hMinRange, dimInputs.hMaxRange, dimInputs.hMin, dimInputs.hMax],
+    ];
+    rangePairs.forEach(([minRange, maxRange, minInput, maxInput]) => {
+      minRange.addEventListener("input", () => {
+        syncRangePair(minRange, maxRange, minInput, maxInput);
+        throttledSearch();
+      });
+      maxRange.addEventListener("input", () => {
+        syncRangePair(minRange, maxRange, minInput, maxInput);
+        throttledSearch();
+      });
+      minInput.addEventListener("change", () => {
+        setRangeFromInput(minInput, minRange, 0);
+        throttledSearch();
+      });
+      maxInput.addEventListener("change", () => {
+        setRangeFromInput(maxInput, maxRange, maxRange.max);
+        throttledSearch();
+      });
     });
   }
 
@@ -684,12 +1262,15 @@
     const sheetNames = workbook.SheetNames;
     updateFileMeta(file, sheetNames);
     renderSheetList(sheetNames);
+    renderSheetPreview(workbook, sheetNames);
   }
 
   async function init() {
     setupFlagFilters();
     setupEventListeners();
     setupSorting();
+    updateCartUI();
+    setViewMode(window.innerWidth < 960 ? "cards" : "table");
     const hasCache = await initFromCache();
     if (!hasCache) showScreen("upload");
   }

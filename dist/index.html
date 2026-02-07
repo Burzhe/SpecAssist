@@ -13,6 +13,10 @@
       <p class="subtitle">Импорт Excel → поиск и сравнение</p>
     </div>
     <div class="header-actions">
+      <button id="theme-toggle" class="ghost">🌙 Тёмная тема</button>
+      <button id="cart-btn" class="ghost cart-btn">
+        🧺 Корзина <span id="cart-count" class="badge">0</span>
+      </button>
       <button id="reset-btn" class="danger">Сбросить проект</button>
     </div>
   </header>
@@ -38,11 +42,18 @@
           <div id="sheet-list" class="sheet-list"></div>
           <button id="import-btn" class="primary" disabled>Импортировать и индексировать</button>
         </div>
+
+        <div id="sheet-preview" class="sheet-preview hidden">
+          <h3>Превью листов</h3>
+          <div id="sheet-preview-tabs" class="sheet-preview-tabs"></div>
+          <div id="sheet-preview-content" class="sheet-preview-content"></div>
+        </div>
       </div>
 
       <div class="card">
         <h2>Прогресс импорта</h2>
         <div id="progress-container" class="progress-container hidden">
+          <div id="progress-message" class="progress-message"></div>
           <div class="progress-row">
             <span>Общий прогресс</span>
             <progress id="overall-progress" value="0" max="100"></progress>
@@ -61,9 +72,13 @@
           <input id="search-input" type="text" placeholder="Поиск по названию или описанию..." />
           <button id="search-btn" class="primary">Найти</button>
         </div>
+        <div class="filter-summary">
+          <span id="active-filters" class="active-filters">Фильтры не применены</span>
+          <button id="reset-filters-btn" class="ghost hidden">Сбросить фильтры</button>
+        </div>
         <div class="filters">
           <div class="filter-group">
-            <label>Категория</label>
+            <label>Категория <span id="category-count" class="pill-count"></span></label>
             <select id="category-filter">
               <option value="">Любая</option>
             </select>
@@ -77,21 +92,39 @@
             <div class="dim-grid">
               <div>
                 <span>W</span>
-                <input type="number" id="w-min" placeholder="мин" />
-                <input type="number" id="w-max" placeholder="макс" />
-                <input type="number" id="w-tol" placeholder="±" />
+                <div class="range-inputs">
+                  <input type="range" id="w-min-range" min="0" max="6000" step="10" value="0" />
+                  <input type="range" id="w-max-range" min="0" max="6000" step="10" value="6000" />
+                </div>
+                <div class="range-values">
+                  <input type="number" id="w-min" placeholder="мин" />
+                  <input type="number" id="w-max" placeholder="макс" />
+                  <input type="number" id="w-tol" placeholder="±" />
+                </div>
               </div>
               <div>
                 <span>D</span>
-                <input type="number" id="d-min" placeholder="мин" />
-                <input type="number" id="d-max" placeholder="макс" />
-                <input type="number" id="d-tol" placeholder="±" />
+                <div class="range-inputs">
+                  <input type="range" id="d-min-range" min="0" max="6000" step="10" value="0" />
+                  <input type="range" id="d-max-range" min="0" max="6000" step="10" value="6000" />
+                </div>
+                <div class="range-values">
+                  <input type="number" id="d-min" placeholder="мин" />
+                  <input type="number" id="d-max" placeholder="макс" />
+                  <input type="number" id="d-tol" placeholder="±" />
+                </div>
               </div>
               <div>
                 <span>H</span>
-                <input type="number" id="h-min" placeholder="мин" />
-                <input type="number" id="h-max" placeholder="макс" />
-                <input type="number" id="h-tol" placeholder="±" />
+                <div class="range-inputs">
+                  <input type="range" id="h-min-range" min="0" max="6000" step="10" value="0" />
+                  <input type="range" id="h-max-range" min="0" max="6000" step="10" value="6000" />
+                </div>
+                <div class="range-values">
+                  <input type="number" id="h-min" placeholder="мин" />
+                  <input type="number" id="h-max" placeholder="макс" />
+                  <input type="number" id="h-tol" placeholder="±" />
+                </div>
               </div>
             </div>
           </div>
@@ -106,12 +139,37 @@
       </div>
 
       <div class="card">
-        <h2>Результаты</h2>
+        <div class="results-header">
+          <h2>Результаты</h2>
+          <div class="results-actions">
+            <div class="view-toggle">
+              <button id="view-table-btn" class="ghost active">Таблица</button>
+              <button id="view-cards-btn" class="ghost">Карточки</button>
+            </div>
+            <button id="export-btn" class="ghost">Экспорт в Excel</button>
+          </div>
+        </div>
         <div id="results-summary" class="results-summary"></div>
-        <div class="table-wrap">
+        <div id="results-empty" class="empty-state hidden">
+          <div class="empty-illustration">🪄</div>
+          <h3>Ничего не найдено</h3>
+          <p>Попробуйте увеличить толерантность размеров или снять фильтр по LED.</p>
+          <div class="empty-actions">
+            <button id="increase-tol-btn" class="ghost">Увеличить ±50мм</button>
+            <button id="remove-led-btn" class="ghost">Убрать фильтр LED</button>
+          </div>
+        </div>
+        <div id="results-loading" class="results-loading hidden">
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+        </div>
+        <div class="table-wrap" id="table-wrap">
           <table id="results-table">
             <thead>
               <tr>
+                <th></th>
                 <th data-sort="name">Наименование</th>
                 <th data-sort="category">Категория</th>
                 <th data-sort="dims">Размеры (мм)</th>
@@ -126,6 +184,7 @@
             <tbody></tbody>
           </table>
         </div>
+        <div id="cards-view" class="cards-view hidden"></div>
       </div>
 
       <aside id="details-drawer" class="details-drawer">
@@ -134,6 +193,31 @@
       </aside>
     </section>
   </main>
+
+  <button id="compare-btn" class="compare-btn hidden">Сравнить (0)</button>
+
+  <div id="compare-modal" class="modal hidden">
+    <div class="modal-content">
+      <button id="close-compare" class="close">×</button>
+      <h3>Сравнение позиций</h3>
+      <div id="compare-table" class="compare-table"></div>
+    </div>
+  </div>
+
+  <aside id="cart-drawer" class="cart-drawer">
+    <div class="cart-header">
+      <h3>Корзина</h3>
+      <button id="close-cart" class="close">×</button>
+    </div>
+    <div id="cart-items" class="cart-items"></div>
+    <div class="cart-summary">
+      <div>Позиций: <strong id="cart-total-items">0</strong></div>
+      <div>Сумма: <strong id="cart-total-price">0</strong></div>
+      <div>Средняя цена/м²: <strong id="cart-avg-price">0</strong></div>
+      <div>Объём: <strong id="cart-total-volume">0</strong></div>
+      <button id="cart-export-btn" class="primary">Экспорт сметы в Excel</button>
+    </div>
+  </aside>
 
   <script src="vendor/xlsx.full.min.js"></script>
   <script src="vendor/flexsearch.bundle.min.js"></script>
