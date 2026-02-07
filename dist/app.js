@@ -501,7 +501,9 @@
 
   function createWorker() {
     const workerSource = document.getElementById("worker-src").textContent;
-    const blob = new Blob([workerSource], { type: "text/javascript" });
+    const vendorUrl = new URL("vendor/xlsx.full.min.js", window.location.href).href;
+    const resolvedSource = workerSource.replace("vendor/xlsx.full.min.js", vendorUrl);
+    const blob = new Blob([resolvedSource], { type: "text/javascript" });
     const url = URL.createObjectURL(blob);
     return new Worker(url);
   }
@@ -555,6 +557,14 @@
         await handleSearch();
         worker.terminate();
       }
+    };
+    worker.onerror = (event) => {
+      elements.progressStats.innerHTML = `
+        <div>Ошибка импорта: ${event.message || "Не удалось загрузить скрипт обработки."}</div>
+        <div>Проверьте, что файлы vendor/xlsx.full.min.js доступны рядом с index.html.</div>
+      `;
+      elements.overallProgressLabel.textContent = "Ошибка";
+      worker.terminate();
     };
 
     const selectedSheets = getSelectedSheets();
